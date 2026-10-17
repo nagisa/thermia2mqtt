@@ -149,8 +149,12 @@ impl PropertyKind for ActiveAlarmsKind {
         let alarms = alarms();
         let mut active = Vec::new();
         for (register, name) in alarms.registers.iter().zip(&alarms.names) {
-            if snapshot.value(*register)?.as_bool() {
-                active.push(name.clone());
+            match snapshot.value(*register) {
+                Some(value) if value.as_bool() => active.push(name.clone()),
+                Some(_) => {}
+                // An alarm that the heat pump does not have is never active.
+                None if snapshot.is_unreadable(*register) => {}
+                None => return None,
             }
         }
         Some(Ok(Box::new(StringList(active))))

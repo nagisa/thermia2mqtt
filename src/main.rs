@@ -1,5 +1,5 @@
 use clap::Parser as _;
-use thermiagenesis2mqtt::commands;
+use thermia2mqtt::commands;
 use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
 #[derive(clap::Parser)]
@@ -7,7 +7,6 @@ use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _
 enum Commands {
     Registers(commands::registers::Args),
     Mqtt(commands::mqtt::Args),
-    Scan(commands::scan::Args),
 }
 
 fn end<E: std::error::Error>(r: Result<(), E>) {
@@ -26,7 +25,7 @@ fn end<E: std::error::Error>(r: Result<(), E>) {
 }
 
 fn main() {
-    let filter_description = std::env::var("THERMIAGENESIS2MQTT_LOG");
+    let filter_description = std::env::var("THERMIA2MQTT_LOG");
     let filter = filter_description
         .as_deref()
         .unwrap_or("info")
@@ -41,6 +40,5 @@ fn main() {
     match Commands::parse() {
         Commands::Registers(args) => end(commands::registers::run(args)),
         Commands::Mqtt(args) => end(commands::mqtt::run(args)),
-        Commands::Scan(args) => end(commands::scan::run(args)),
     }
 }

@@ -63,6 +63,7 @@ fn homie_unit(unit: &str) -> Option<&'static str> {
         "V" => "V",
         "W" => "W",
         "kWh" => "kWh",
+        "kW" => "kW",
         "h" => "h",
         "min" => "min",
         "bar(g)" => "bar",

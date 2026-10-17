@@ -306,7 +306,7 @@ impl Device {
             .flat_map(|property| property.kind.registers().iter().copied())
             .collect();
         loop {
-            let missing = self.modbus.snapshot().missing(needed.iter().copied());
+            let missing = self.modbus.snapshot().unresolved(needed.iter().copied());
             if missing.is_empty() {
                 return Ok(());
             }
@@ -757,7 +757,7 @@ mod tests {
             "PT133417H"
         );
         assert_eq!(value_of("system", "running-demand", &snapshot).unwrap(), "heat");
-        assert_eq!(value_of("system", "comfort-mode", &snapshot).unwrap(), "comfort");
+        assert_eq!(value_of("system", "smart-grid-mode", &snapshot).unwrap(), "comfort");
         assert_eq!(value_of("system", "mode", &snapshot).unwrap(), "on");
         assert_eq!(value_of("heating", "enabled", &snapshot).unwrap(), "true");
         // (1 << 16 | 2) / 10
@@ -881,6 +881,10 @@ mod tests {
 
     /// A device that is not connected to anything, with the specified registers set.
     fn test_device(args: Args, words: &[(Space, u16, u16)]) -> Device {
+        test_device_from(args, snapshot(words))
+    }
+
+    fn test_device_from(args: Args, snapshot: Snapshot) -> Device {
         let nodes = select_nodes(&args).unwrap();
         let (client, _) = rumqttc::v5::AsyncClient::new(
             rumqttc::v5::MqttOptions::new("test", "127.0.0.1", 1883),
@@ -892,7 +896,7 @@ mod tests {
         );
         let (_, updates) = mpsc::unbounded_channel();
         let (_, commands) = mpsc::unbounded_channel();
-        let handle = modbus::Handle::detached(snapshot(words));
+        let handle = modbus::Handle::detached(snapshot);
         Device::new(args, client, protocol, nodes, handle, updates, commands).unwrap()
     }
 
@@ -944,5 +948,108 @@ mod tests {
         // This is what makes the device describe itself again, when a sensor shows up.
         assert_ne!(available, present.compute_availability());
         assert_eq!(present.compute_availability(), present.available);
+    }
+    #[test]
+    fn coefficient_of_performance() {
+        // 12.5 kW of heat out of 3 kW of electricity.
+        let running = snapshot(&[(Space::Input, 157, 1250), (Space::Input, 158, 300)]);
+        assert_eq!(value_of("power", "output", &running).unwrap(), "12.5");
+        assert_eq!(value_of("power", "consumption", &running).unwrap(), "3");
+        assert_eq!(value_of("power", "cop", &running).unwrap(), "4.17");
+        // Nothing consumed, nothing to divide by. This must stay a value: a property that comes
+        // and goes changes what the device is described as.
+        let idle = snapshot(&[(Space::Input, 157, 0), (Space::Input, 158, 0)]);
+        assert_eq!(value_of("power", "cop", &idle).unwrap(), "0");
+    }
+    #[test]
+    fn registers_that_the_heat_pump_does_not_have() {
+        let args = Args::parse_from(["test", "--nodes", "alarms,power,power-limit"]);
+        // No alarms are active.
+        let quiet: Vec<_> = property("alarms", "active")
+            .kind
+            .registers()
+            .iter()
+            .map(|r| (r.space(), r.address(), 0))
+            .collect();
+        let mut words = all_registers(&args, &quiet);
+        // No alarm 83 (a discrete input) and no holding registers for the power limit.
+        let not_there = |space, address| {
+            (space == Space::DiscreteInput && address == 83)
+                || (space == Space::Holding && matches!(address, 124 | 125))
+        };
+        words.retain(|&(space, address, _)| !not_there(space, address));
+        let mut snapshot = snapshot(&words);
+        snapshot.set_unreadable(Space::DiscreteInput, 83);
+        snapshot.set_unreadable(Space::Holding, 124);
+        snapshot.set_unreadable(Space::Holding, 125);
+        // An alarm that is not there is not active, and does not make the rest unknowable.
+        assert_eq!(value_of("alarms", "active", &snapshot).unwrap(), "[]");
+
+        let device = test_device_from(args.clone(), snapshot);
+        let available = device.compute_availability();
+        let description = build_description(&args, &device.nodes, &available);
+        let described = |node: &str, prop: &str| {
+            let (node, prop) = (node.parse::<HomieID>().unwrap(), prop.parse::<HomieID>().unwrap());
+            description.get_property_by_id(&node, &prop).is_some()
+        };
+        assert!(described("alarms", "active"));
+        assert!(described("power", "output"));
+        assert!(!described("power-limit", "limit"));
+        assert!(!described("power-limit", "control-mode"));
+    }
+    #[test]
+    fn statistics_match_the_display() {
+        // What the registers held when the display showed these (the day and year, heat and tap
+        // water): delivered 20.4 kWh and 9.3 MWh; consumed 3.7 kWh and 1.7 MWh; COP 5.5 and 5.6;
+        // natural source 17.1 kWh and 7.7 MWh; internal heater 0 kWh and 1 kWh. And for the tap
+        // water 6.1 kWh and 2.6 MWh; 1.8 kWh and 705 kWh; COP 3.3 and 3.6; 4.4 kWh and 1.8 MWh;
+        // 0 kWh and 49 kWh.
+        let registers: &[(u16, u16)] = &[
+            (331, 3),
+            (332, 20),
+            (333, 55),
+            (334, 17),
+            (335, 0),
+            (336, 1),
+            (337, 6),
+            (338, 33),
+            (339, 4),
+            (340, 0),
+            (348, 1),
+            (349, 0),
+            (350, 651),
+            (351, 1),
+            (352, 263),
+            (353, 9),
+            (354, 56),
+            (355, 670),
+            (356, 7),
+            (357, 49),
+            (358, 0),
+            (359, 705),
+            (360, 0),
+            (361, 572),
+            (362, 2),
+            (363, 36),
+            (364, 773),
+            (365, 1),
+        ];
+        let words: Vec<_> = registers.iter().map(|&(a, w)| (Space::Input, a, w)).collect();
+        let snapshot = snapshot(&words);
+        let value = |prop| value_of("statistics", prop, &snapshot).unwrap();
+        // The whole kWh, the display has a decimal that we do not know where to find yet.
+        assert_eq!(value("heat-delivered-today"), "20");
+        assert_eq!(value("heat-cop-today"), "5.5");
+        assert_eq!(value("tap-water-cop-today"), "3.3");
+        assert_eq!(value("heat-delivered-year"), "9263"); // 9.3 MWh
+        assert_eq!(value("heat-consumed-year"), "1651"); // 1.7 MWh
+        assert_eq!(value("heat-natural-year"), "7670"); // 7.7 MWh
+        assert_eq!(value("heat-internal-heater-year"), "1");
+        assert_eq!(value("heat-cop-year"), "5.6");
+        assert_eq!(value("tap-water-consumed-year"), "705");
+        assert_eq!(value("tap-water-delivered-year"), "2572"); // 2.6 MWh
+        assert_eq!(value("tap-water-natural-year"), "1773"); // 1.8 MWh
+        assert_eq!(value("tap-water-internal-heater-year"), "49");
+        assert_eq!(value("tap-water-cop-year"), "3.6");
     }
 }

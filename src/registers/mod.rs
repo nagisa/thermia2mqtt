@@ -1,5 +1,5 @@
-//! The registers of the heat pump as documented in the Thermia "Modbus protocol for Mega, Genesis
-//! platform" guide.
+//! The registers of the heat pump as documented in the Thermia Modbus guides for the Genesis
+//! platform.
 //!
 //! The guide splits the registers up into four address spaces, each with its own function codes.
 //! Addresses are only unique within a single space. The addresses used throughout this crate are the

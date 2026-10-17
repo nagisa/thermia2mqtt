@@ -1,5 +1,5 @@
 [package]
-name = "thermiagenesis2mqtt"
+name = "thermia2mqtt"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"

@@ -376,3 +376,63 @@ impl RegisterPropertyValue for MinutesValue {
         registers::to_raw(register, minutes)
     }
 }
+
+/// The coefficient of performance right now: how much heat the heat pump delivers for the
+/// electricity it consumes. It is 0 while nothing is consumed.
+pub(crate) struct CoefficientOfPerformance(f64);
+impl CoefficientOfPerformance {
+    pub(crate) fn new(output: Value, consumed: Value) -> Result<Self, ()> {
+        if consumed.raw() == 0 {
+            return Ok(Self(0.0));
+        }
+        let ratio = f64::from(output.raw()) / f64::from(consumed.raw());
+        Ok(Self((ratio * 100.0).round() / 100.0))
+    }
+}
+impl PropertyValue for CoefficientOfPerformance {
+    fn value(&self) -> String {
+        self.0.to_string()
+    }
+}
+impl PropertyDescription for CoefficientOfPerformance {
+    fn description(_: &PropertyEntry) -> HomiePropertyDescription {
+        PropertyDescriptionBuilder::float().build()
+    }
+}
+impl AggregatePropertyValue for CoefficientOfPerformance {
+    const SETTABLE: bool = false;
+}
+impl TryFrom<&str> for CoefficientOfPerformance {
+    type Error = ();
+    fn try_from(_: &str) -> Result<Self, Self::Error> {
+        Err(())
+    }
+}
+
+/// Energy that the heat pump keeps in two registers: one has the kWh (up to 999), the other the
+/// MWh (each being 1000 kWh.)
+pub(crate) struct SplitEnergy(u32);
+impl SplitEnergy {
+    pub(crate) fn new(kwh: Value, mwh: Value) -> Result<Self, ()> {
+        Ok(Self(u32::from(mwh.raw()) * 1000 + u32::from(kwh.raw())))
+    }
+}
+impl PropertyValue for SplitEnergy {
+    fn value(&self) -> String {
+        self.0.to_string()
+    }
+}
+impl PropertyDescription for SplitEnergy {
+    fn description(_: &PropertyEntry) -> HomiePropertyDescription {
+        PropertyDescriptionBuilder::float().unit("kWh").build()
+    }
+}
+impl AggregatePropertyValue for SplitEnergy {
+    const SETTABLE: bool = false;
+}
+impl TryFrom<&str> for SplitEnergy {
+    type Error = ();
+    fn try_from(_: &str) -> Result<Self, Self::Error> {
+        Err(())
+    }
+}

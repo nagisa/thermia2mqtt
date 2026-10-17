@@ -14,9 +14,9 @@ use crate::homie::custom::{
 };
 use crate::homie::node::{Node, PropertyEntry, properties};
 use crate::homie::value::{
-    ActionPropertyValue, AggregatePropertyValue, BooleanValue, EnergyValue, FloatValue,
-    IntegerValue, MinutesValue, OperatingTime, PropertyDescription, PropertyValue, SecondsValue,
-    VersionValue, homie_enum, string_enum, unit,
+    ActionPropertyValue, AggregatePropertyValue, BooleanValue, CoefficientOfPerformance,
+    EnergyValue, FloatValue, IntegerValue, MinutesValue, OperatingTime, PropertyDescription,
+    PropertyValue, SecondsValue, SplitEnergy, VersionValue, homie_enum, string_enum, unit,
 };
 use crate::registers::{Register, Value};
 use homie5::HomieID;
@@ -56,7 +56,7 @@ string_enum! {
     #[impl(TryFromValue, PropertyValue, RegisterPropertyValue, PropertyDescription)]
     #[repr(u16)]
     #[derive(Clone, Copy)]
-    enum ComfortMode {
+    enum SmartGridMode {
         Evu = 1,
         Normal = 4,
         Comfort = 5,
@@ -189,7 +189,7 @@ properties! { static ALARMS = [
 
 properties! { static SYSTEM = [
     { "mode": OperationalMode = register holding(0) },
-    { "comfort-mode": ComfortMode = register input(82) },
+    { "smart-grid-mode": SmartGridMode = register input(82) },
     { "running-demand": Demand = register input(1) },
     { "running-demands": RunningDemands = aggregate input(2) },
     { "running-demands-by-priority": RunningDemandList = aggregate input(1), input(55), input(56) },
@@ -544,6 +544,40 @@ properties! { static SECONDARY_UNITS = [
     { "legacy-expansion-card-lost": UnitBits = aggregate input(173) },
 ] }
 
+properties! { static POWER = [
+    { "output": FloatValue = register input(157) },
+    { "consumption": FloatValue = register input(158) },
+    { "cop": CoefficientOfPerformance = aggregate input(157), input(158) },
+] }
+
+properties! { static POWER_LIMIT = [
+    { "control-mode": IntegerValue = register holding(124) },
+    { "limit": FloatValue = register holding(125) },
+] }
+
+properties! { static STATISTICS = [
+    { "heat-consumed-today": FloatValue = register input(331) },
+    { "heat-delivered-today": FloatValue = register input(332) },
+    { "heat-cop-today": FloatValue = register input(333) },
+    { "heat-natural-today": FloatValue = register input(334) },
+    { "heat-internal-heater-today": FloatValue = register input(335) },
+    { "heat-consumed-year": SplitEnergy = aggregate input(350), input(351) },
+    { "heat-delivered-year": SplitEnergy = aggregate input(352), input(353) },
+    { "heat-cop-year": FloatValue = register input(354) },
+    { "heat-natural-year": SplitEnergy = aggregate input(355), input(356) },
+    { "heat-internal-heater-year": SplitEnergy = aggregate input(348), input(349) },
+    { "tap-water-consumed-today": FloatValue = register input(336) },
+    { "tap-water-delivered-today": FloatValue = register input(337) },
+    { "tap-water-cop-today": FloatValue = register input(338) },
+    { "tap-water-natural-today": FloatValue = register input(339) },
+    { "tap-water-internal-heater-today": FloatValue = register input(340) },
+    { "tap-water-consumed-year": SplitEnergy = aggregate input(359), input(360) },
+    { "tap-water-delivered-year": SplitEnergy = aggregate input(361), input(362) },
+    { "tap-water-cop-year": FloatValue = register input(363) },
+    { "tap-water-natural-year": SplitEnergy = aggregate input(364), input(365) },
+    { "tap-water-internal-heater-year": SplitEnergy = aggregate input(357), input(358) },
+] }
+
 properties! { static IMMERSION_HEATER = [
     { "enabled": ImmersionHeater = register holding(321) },
     { "step": IntegerValue = register input(67) },
@@ -577,7 +611,7 @@ macro_rules! node {
     };
 }
 
-static NODES: [Node; 21] = [
+static NODES: [Node; 24] = [
     node!("alarms", "alarms", ALARMS),
     node!("system", "operating mode, versions and sensors of the system", SYSTEM),
     node!("heat-pump", "the compressor and the refrigerant circuit", HEAT_PUMP),
@@ -597,7 +631,10 @@ static NODES: [Node; 21] = [
     node!("hot-gas-pump", "hot gas pump", HOT_GAS_PUMP),
     node!("surplus-heat", "surplus heat (expansion module)", SURPLUS_HEAT),
     node!("secondary-units", "secondary heat pump units", SECONDARY_UNITS),
-    node!("immersion-heater", "internal immersion heater (Mega S-E only)", IMMERSION_HEATER),
+    node!("power", "power output and consumption", POWER),
+    node!("power-limit", "limiting the power consumption", POWER_LIMIT),
+    node!("statistics", "energy statistics (registers that Thermia does not document)", STATISTICS),
+    node!("immersion-heater", "internal immersion heater", IMMERSION_HEATER),
     node!(
         "electric-meter",
         "electric meter and current limitation (requires the current limiter accessory)",

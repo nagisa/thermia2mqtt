@@ -1,5 +1,5 @@
 use crate::registers::{Register, Space, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// What we know about the contents of the registers of the heat pump.
 ///
@@ -7,6 +7,8 @@ use std::collections::BTreeMap;
 #[derive(Default)]
 pub struct Snapshot {
     values: [BTreeMap<u16, u16>; 4],
+    /// The addresses that the heat pump has been found to not have anything at.
+    unreadable: [BTreeSet<u16>; 4],
 }
 
 impl Snapshot {
@@ -33,9 +35,29 @@ impl Snapshot {
         self.values[space.index()].insert(address, raw) != Some(raw)
     }
 
+    /// Record that the heat pump has nothing at this address. Returns `true` if this is news.
+    pub(crate) fn set_unreadable(&mut self, space: Space, address: u16) -> bool {
+        self.unreadable[space.index()].insert(address)
+    }
+
+    /// The heat pump has no register at this address, and there is no point in asking for it.
+    pub fn is_unreadable(&self, register: Register) -> bool {
+        self.unreadable[register.space().index()].contains(&register.address())
+    }
+
+    /// All of the addresses known to be unreadable in the space.
+    pub(crate) fn unreadable_addresses(&self, space: Space) -> &BTreeSet<u16> {
+        &self.unreadable[space.index()]
+    }
+
     /// The registers out of those specified that have not been read yet.
     pub fn missing(&self, registers: impl IntoIterator<Item = Register>) -> Vec<Register> {
         registers.into_iter().filter(|&r| !self.contains(r)).collect()
+    }
+
+    /// The registers that we do not know the fate of yet: neither read, nor found to be unreadable.
+    pub fn unresolved(&self, registers: impl IntoIterator<Item = Register>) -> Vec<Register> {
+        registers.into_iter().filter(|&r| !self.contains(r) && !self.is_unreadable(r)).collect()
     }
 }
 
@@ -53,5 +75,20 @@ mod tests {
         assert_eq!(snapshot.raw(Space::Input, 22), Some(1));
         assert_eq!(snapshot.value(Register::holding(22)).map(|v| v.raw()), Some(3));
         assert_eq!(snapshot.missing([Register::holding(22), Register::holding(23)]).len(), 1);
+    }
+
+    #[test]
+    fn unreadable_registers_are_resolved() {
+        let mut snapshot = Snapshot::new();
+        let registers = [Register::holding(22), Register::holding(23), Register::input(22)];
+        assert_eq!(snapshot.unresolved(registers).len(), 3);
+        snapshot.set(Space::Holding, 22, 1);
+        assert!(snapshot.set_unreadable(Space::Holding, 23));
+        assert!(!snapshot.set_unreadable(Space::Holding, 23));
+        // Unreadable in one space does not say anything about the others.
+        assert_eq!(snapshot.unresolved(registers), vec![Register::input(22)]);
+        assert_eq!(snapshot.missing(registers).len(), 2);
+        assert!(snapshot.is_unreadable(Register::holding(23)));
+        assert!(!snapshot.is_unreadable(Register::input(22)));
     }
 }

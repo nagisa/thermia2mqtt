@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::ops::RangeInclusive;
 
 /// Split a list of addresses into ranges that are cheap to read out.
@@ -39,9 +40,33 @@ pub(crate) fn find_optimal_ranges(
     ranges
 }
 
+/// Like [`find_optimal_ranges`], but no range will go over any of the `barriers`.
+///
+/// This is for addresses that are known to not be readable. A request that covers such an address
+/// is rejected as a whole. The `addresses` must be sorted, without duplicates and without any of
+/// the barriers.
+pub(crate) fn find_optimal_ranges_around(
+    addresses: &[u16],
+    barriers: &BTreeSet<u16>,
+    max_range_len: u16,
+) -> Vec<RangeInclusive<u16>> {
+    let mut ranges = Vec::new();
+    let mut run_start = 0;
+    for i in 1..=addresses.len() {
+        let ends_run = i == addresses.len()
+            || barriers.range(addresses[i - 1] + 1..addresses[i]).next().is_some();
+        if ends_run {
+            ranges.extend(find_optimal_ranges(&addresses[run_start..i], max_range_len));
+            run_start = i;
+        }
+    }
+    ranges
+}
+
 #[cfg(test)]
 mod tests {
     use super::find_optimal_ranges as plan;
+    use std::collections::BTreeSet;
 
     #[test]
     fn empty() {
@@ -63,6 +88,18 @@ mod tests {
     fn fewest_ranges_then_shortest() {
         // Two ranges are needed either way, but 1..=2 + 10..=12 is shorter than 1..=11 + 12..=12.
         assert_eq!(plan(&[1, 2, 10, 11, 12], 11), vec![1..=2, 10..=12]);
+    }
+
+    #[test]
+    fn ranges_stay_away_from_barriers() {
+        use super::find_optimal_ranges_around as around;
+        let barriers: BTreeSet<u16> = [5, 6, 20].into();
+        // Without the barrier this would be a single range.
+        assert_eq!(around(&[1, 2, 3, 4, 7, 8], &barriers, 100), vec![1..=4, 7..=8]);
+        assert_eq!(around(&[1, 10, 30], &barriers, 100), vec![1..=1, 10..=10, 30..=30]);
+        assert_eq!(around(&[10, 11, 30], &barriers, 100), vec![10..=11, 30..=30]);
+        assert_eq!(around(&[1, 2, 3], &BTreeSet::new(), 100), vec![1..=3]);
+        assert!(around(&[], &barriers, 100).is_empty());
     }
 
     #[test]

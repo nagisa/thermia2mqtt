@@ -22,6 +22,7 @@ use std::sync::{Arc, RwLock, RwLockReadGuard};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
+use tokio_modbus::ExceptionCode;
 use tracing::{debug, info, warn};
 
 #[derive(thiserror::Error, Debug)]
@@ -162,8 +163,10 @@ pub async fn connect(args: &Args, polls: Vec<PollGroup>) -> Result<Device, Error
     let snapshot = Arc::new(RwLock::new(Snapshot::new()));
     let (update_tx, updates) = mpsc::unbounded_channel();
     let (command_tx, command_rx) = mpsc::unbounded_channel();
-    let groups: Vec<Group> =
-        polls.into_iter().map(|poll| Group::new(poll, args.max_read_count)).collect();
+    let groups: Vec<Group> = {
+        let snapshot = snapshot.read().unwrap_or_else(|e| e.into_inner());
+        polls.into_iter().map(|poll| Group::new(poll, args.max_read_count, &snapshot)).collect()
+    };
     for group in &groups {
         debug!(period = ?group.period, reads = ?group.reads, "polling group");
     }
@@ -178,49 +181,63 @@ pub async fn connect(args: &Args, polls: Vec<PollGroup>) -> Result<Device, Error
         snapshot: Arc::clone(&snapshot),
         updates: update_tx,
         groups,
+        max_read_count: args.max_read_count,
     };
     let task = tokio::task::spawn(worker.run(command_rx));
     Ok(Device { handle: Handle { snapshot, commands: command_tx }, updates, task })
 }
 
-/// Read out everything that is readable in a range of addresses, documented or not.
+/// What reading a range of addresses has turned up.
+#[derive(Debug, Default)]
+struct ReadOutcome {
+    /// The words that were read, with their addresses.
+    words: Vec<(u16, u16)>,
+    /// The addresses that the heat pump has nothing at.
+    unreadable: Vec<u16>,
+}
+
+fn halves(read: Read) -> [Read; 2] {
+    let half = read.count / 2;
+    [
+        Read { count: half, ..read },
+        Read { start: read.start + half, count: read.count - half, ..read },
+    ]
+}
+
+fn is_missing_address(error: &RequestError) -> bool {
+    matches!(error, RequestError::Exception(_, ExceptionCode::IllegalDataAddress))
+}
+
+/// Read a range of addresses, and find out what can be read out of it if it can not be read as a
+/// whole.
 ///
-/// A request that covers addresses that the heat pump has nothing at is rejected as a whole, so
-/// those are split up until the readable addresses are known.
-pub async fn scan(
-    pool: &Pool,
-    space: Space,
-    from: u16,
-    to: u16,
-    chunk: u16,
-) -> Result<BTreeMap<u16, u16>, RequestError> {
-    let mut found = BTreeMap::new();
-    let mut pending: Vec<(u16, u16)> = (u32::from(from)..=u32::from(to))
-        .step_by(usize::from(chunk.max(1)))
-        .map(|start| {
-            let count = (u32::from(to) + 1 - start).min(u32::from(chunk.max(1)));
-            (start as u16, count as u16)
-        })
-        .collect();
+/// The heat pump rejects a request if there's an address in the range that it has nothing at. Which
+/// addresses these are cannot be guessed. There are holes all over, and what is on one side of a
+/// hole says nothing about the other. So the range is split in halves until the parts can be read
+/// or are a single address.
+async fn read_resilient(pool: &Pool, read: Read) -> Result<ReadOutcome, RequestError> {
+    let mut outcome = ReadOutcome::default();
+    let mut pending = vec![read];
+    let mut first = true;
     while !pending.is_empty() {
-        let requests = pending.iter().map(|&(start, count)| pool.read(space, start, count));
+        let requests = pending.iter().map(|r| pool.read(r.space, r.start, r.count));
         let responses = futures::future::join_all(requests).await;
-        let mut split = Vec::new();
-        for (&(start, count), response) in pending.iter().zip(responses) {
+        let mut next = Vec::new();
+        for (&read, response) in pending.iter().zip(responses) {
             match response {
-                Ok(words) => found.extend((start..).zip(words)),
-                Err(RequestError::Exception(..)) if count > 1 => {
-                    let half = count / 2;
-                    split.push((start, half));
-                    split.push((start + half, count - half));
-                }
-                Err(RequestError::Exception(..)) => {}
+                Ok(words) => outcome.words.extend((read.start..).zip(words)),
+                Err(e) if is_missing_address(&e) && read.count > 1 => next.extend(halves(read)),
+                Err(e) if is_missing_address(&e) => outcome.unreadable.push(read.start),
                 Err(e) => return Err(e),
             }
         }
-        pending = split;
+        if first && !next.is_empty() {
+            debug!(?read, "the heat pump rejected the request, splitting it up");
+        }
+        first = false;
+        pending = next;
     }
-    Ok(found)
+    Ok(outcome)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -232,6 +249,9 @@ struct Read {
 
 struct Group {
     period: Duration,
+    /// What is to be polled.
+    registers: Vec<Register>,
+    /// How to go about reading the registers.
     reads: Vec<Read>,
     next_due: Instant,
     /// A read out is in progress.
@@ -241,29 +261,37 @@ struct Group {
 }
 
 impl Group {
-    fn new(poll: PollGroup, max_read_count: u16) -> Group {
+    fn new(poll: PollGroup, max_read_count: u16, snapshot: &Snapshot) -> Group {
+        let mut group = Group {
+            period: poll.period,
+            registers: poll.registers,
+            reads: Vec::new(),
+            next_due: Instant::now(),
+            running: false,
+            failing: false,
+            slow: false,
+        };
+        group.plan(max_read_count, snapshot);
+        group
+    }
+
+    /// Work out what requests to make, and keep away from where the heat pump has nothing.
+    fn plan(&mut self, max_read_count: u16, snapshot: &Snapshot) {
         let mut addresses: BTreeMap<Space, Vec<u16>> = BTreeMap::new();
-        for register in poll.registers {
+        for &register in self.registers.iter().filter(|&&r| !snapshot.is_unreadable(r)) {
             addresses.entry(register.space()).or_default().push(register.address());
         }
-        let mut reads = Vec::new();
+        self.reads.clear();
         for (space, mut addresses) in addresses {
             addresses.sort_unstable();
             addresses.dedup();
             // The protocol does not allow for more than this many words in a response.
             let limit = if space.is_bit() { max_read_count } else { max_read_count.min(125) };
-            for range in plan::find_optimal_ranges(&addresses, limit) {
+            let barriers = snapshot.unreadable_addresses(space);
+            for range in plan::find_optimal_ranges_around(&addresses, barriers, limit) {
                 let (start, end) = range.into_inner();
-                reads.push(Read { space, start, count: end - start + 1 });
+                self.reads.push(Read { space, start, count: end - start + 1 });
             }
-        }
-        Group {
-            period: poll.period,
-            reads,
-            next_due: Instant::now(),
-            running: false,
-            failing: false,
-            slow: false,
         }
     }
 }
@@ -273,7 +301,7 @@ struct Finished {
     group: usize,
     started: Instant,
     reads: Vec<Read>,
-    results: Vec<Result<Vec<u16>, RequestError>>,
+    results: Vec<Result<ReadOutcome, RequestError>>,
 }
 
 /// The outcome of writing registers, and reading them back.
@@ -300,6 +328,7 @@ struct Worker {
     snapshot: Arc<RwLock<Snapshot>>,
     updates: mpsc::UnboundedSender<Update>,
     groups: Vec<Group>,
+    max_read_count: u16,
 }
 
 impl Worker {
@@ -349,10 +378,14 @@ impl Worker {
         let Finished { group: index, started, reads, results } = finished;
         let mut changed = Vec::new();
         let mut failed = false;
+        let mut discovered = Vec::new();
         for (read, result) in reads.iter().zip(results) {
             match result {
-                Ok(words) => self.apply(read.space, read.start, &words, &mut changed),
-                // Not every heat pump has every register that is documented in the guide.
+                Ok(outcome) => {
+                    self.apply_pairs(read.space, &outcome.words, &mut changed);
+                    discovered.extend(outcome.unreadable.into_iter().map(|a| (read.space, a)));
+                }
+                // The heat pump didn't like this for some reason that isn't about the addresses.
                 Err(RequestError::Exception(request, code)) => {
                     failed = true;
                     if !self.groups[index].failing {
@@ -362,6 +395,7 @@ impl Worker {
                 Err(e) => return Err(e.into()),
             }
         }
+        let discovered = self.note_unreadable(discovered);
         let group = &mut self.groups[index];
         group.running = false;
         group.failing = failed;
@@ -382,16 +416,46 @@ impl Worker {
         }
         // Don't try to catch up if we've fallen behind.
         group.next_due = (group.next_due + group.period).max(Instant::now());
-        if !changed.is_empty() {
-            debug!(count = changed.len(), ?took, "registers changed");
+        // Finding out that there is nothing at an address is news, too. Those waiting for the
+        // register to appear can stop waiting.
+        if !changed.is_empty() || discovered {
+            debug!(count = changed.len(), ?took, discovered, "registers changed");
             let _ = self.updates.send(Update { changed });
         }
         Ok(())
     }
 
-    fn apply(&self, space: Space, start: u16, words: &[u16], changed: &mut Vec<Register>) {
+    /// Remember the addresses that were found to not be there, and stop asking for them.
+    ///
+    /// Returns whether there was anything new.
+    fn note_unreadable(&mut self, addresses: Vec<(Space, u16)>) -> bool {
         let mut snapshot = self.snapshot.write().unwrap_or_else(|e| e.into_inner());
-        for (address, &word) in (start..).zip(words) {
+        let mut new: BTreeMap<Space, Vec<u16>> = BTreeMap::new();
+        for (space, address) in addresses {
+            if snapshot.set_unreadable(space, address) {
+                new.entry(space).or_default().push(address);
+            }
+        }
+        for (space, addresses) in &new {
+            info!(%space, ?addresses, "the heat pump has nothing at these addresses");
+        }
+        if new.is_empty() {
+            return false;
+        }
+        for group in &mut self.groups {
+            group.plan(self.max_read_count, &snapshot);
+        }
+        true
+    }
+
+    fn apply(&self, space: Space, start: u16, words: &[u16], changed: &mut Vec<Register>) {
+        let pairs: Vec<(u16, u16)> = (start..).zip(words.iter().copied()).collect();
+        self.apply_pairs(space, &pairs, changed);
+    }
+
+    fn apply_pairs(&self, space: Space, words: &[(u16, u16)], changed: &mut Vec<Register>) {
+        let mut snapshot = self.snapshot.write().unwrap_or_else(|e| e.into_inner());
+        for &(address, word) in words {
             if snapshot.set(space, address, word) {
                 changed.extend(Register::lookup(space, address));
             }
@@ -458,7 +522,7 @@ async fn write_out(
 async fn read_out(pool: Arc<Pool>, group: usize, reads: Vec<Read>) -> Done {
     let started = Instant::now();
     let results =
-        futures::future::join_all(reads.iter().map(|r| pool.read(r.space, r.start, r.count))).await;
+        futures::future::join_all(reads.iter().map(|&read| read_resilient(&pool, read))).await;
     Done::Read(Finished { group, started, reads, results })
 }
 
@@ -510,7 +574,12 @@ mod tests {
                             continue;
                         }
                         let mut pdu = Vec::new();
-                        if function == 4 && (start..start + count).contains(&319) {
+                        let holes_in_the_holding_registers =
+                            function == 3 && start <= 106 && start + count > 105;
+                        if (function == 4 && (start..start + count).contains(&319))
+                            || holes_in_the_holding_registers
+                        {
+                            seen.rejected.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                             pdu.extend([function | 0x80, 2]);
                         } else if function <= 2 {
                             let bits = (start..start + count).map(|a| a % 2 == 1);
@@ -552,6 +621,8 @@ mod tests {
     struct Counters {
         requests: std::sync::atomic::AtomicUsize,
         connections: std::sync::atomic::AtomicUsize,
+        /// How many requests were rejected for asking about addresses that are not there.
+        rejected: std::sync::atomic::AtomicUsize,
         /// What has been written to the holding registers.
         written: Mutex<std::collections::HashMap<u16, u16>>,
     }
@@ -559,6 +630,10 @@ mod tests {
     impl Counters {
         fn requests(&self) -> usize {
             self.requests.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn rejected(&self) -> usize {
+            self.rejected.load(std::sync::atomic::Ordering::SeqCst)
         }
 
         fn connections(&self) -> usize {
@@ -675,19 +750,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scanning_finds_what_can_be_read() {
+    async fn holes_are_found_and_avoided() {
+        // The fake heat pump has no holding registers 105 and 106, and rejects any request that has
+        // them in it.
         let (address, counters) = fake_heat_pump(Duration::ZERO).await;
-        let pool = connect_pool(&args(address, &[])).await.unwrap();
-        // The fake heat pump refuses to read input register 319.
-        let found = scan(&pool, Space::Input, 300, 330, 10).await.unwrap();
-        let expected: Vec<u16> = (300..=330).filter(|a| *a != 319).collect();
-        assert_eq!(found.keys().copied().collect::<Vec<_>>(), expected);
-        assert_eq!(found[&311], 311 + 4000);
-        // The chunk of 10 was split up, but not more than necessary.
-        assert!(counters.requests() < 31, "{} requests", counters.requests());
-        // Everything is fine with the ones that are not at the edge.
-        let found = scan(&pool, Space::Holding, 0, 99, 25).await.unwrap();
-        assert_eq!(found.len(), 100);
+        let registers = vec![
+            Register::holding(22),
+            Register::holding(49),
+            // This is one of those that are not there.
+            Register::holding(105),
+            Register::holding(124),
+            Register::holding(125),
+            Register::input(13),
+        ];
+        let polls = vec![PollGroup { period: Duration::from_millis(50), registers }];
+        let mut device = connect(&args(address, &[]), polls).await.unwrap();
+
+        // Everything that can be read gets read, even though the requests to begin with covered
+        // the hole, and the register that is not there is known to be missing.
+        let mut seen = std::collections::BTreeSet::new();
+        while !device.handle.snapshot().unresolved(one_of_each(&[22, 49, 105, 124, 125])).is_empty()
+        {
+            let update = tokio::time::timeout(Duration::from_secs(5), device.updates.recv())
+                .await
+                .expect("the registers are sorted out")
+                .unwrap();
+            seen.extend(update.changed);
+        }
+        {
+            let snapshot = device.handle.snapshot();
+            for address in [22, 49, 124, 125] {
+                assert_eq!(
+                    snapshot.raw(Space::Holding, address),
+                    Some(address + 3000),
+                    "{address}"
+                );
+            }
+            assert!(snapshot.is_unreadable(Register::holding(105)));
+            assert!(
+                snapshot.is_unreadable(Register::holding(106))
+                    || !snapshot.contains(Register::holding(106))
+            );
+            assert!(!snapshot.is_unreadable(Register::holding(49)));
+            assert!(snapshot.value(Register::holding(105)).is_none());
+        }
+
+        // Having found out, no more requests are made for what is not there.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let rejected = counters.rejected();
+        assert!(rejected > 0);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(counters.rejected(), rejected, "still asking for what is not there");
+        assert!(!device.task.is_finished());
+    }
+
+    fn one_of_each(addresses: &[u16]) -> Vec<Register> {
+        addresses.iter().map(|&a| Register::holding(a)).collect()
     }
 
     #[tokio::test]
@@ -711,7 +829,9 @@ mod tests {
         assert!(!device.task.is_finished());
         assert!(counters.requests() >= 2);
         assert_eq!(device.handle.snapshot().raw(Space::Input, 13), Some(4013));
-        assert_eq!(device.handle.snapshot().raw(Space::Input, 311), None);
+        // What was in the same request as the rejected register is not lost.
+        assert_eq!(device.handle.snapshot().raw(Space::Input, 311), Some(4311));
+        assert!(device.handle.snapshot().is_unreadable(Register::input(319)));
         // The connection that has seen the rejection is still good to be used.
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(!device.task.is_finished());
