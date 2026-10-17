@@ -9,6 +9,7 @@ pub struct Snapshot {
     values: [BTreeMap<u16, u16>; 4],
     /// The addresses that the heat pump has been found to not have anything at.
     unreadable: [BTreeSet<u16>; 4],
+    reachable: bool,
 }
 
 impl Snapshot {
@@ -28,6 +29,18 @@ impl Snapshot {
 
     pub fn contains(&self, register: Register) -> bool {
         self.raw(register.space(), register.address()).is_some()
+    }
+
+    /// Whether connections to the heat pump can be opened: the last requests did not all fail to
+    /// open one. A heat pump that is connected to but does not respond properly is reachable. Not
+    /// known to be until a request has got through.
+    pub fn reachable(&self) -> bool {
+        self.reachable
+    }
+
+    /// Record whether connections to the heat pump can be opened. Returns `true` if this is news.
+    pub(crate) fn set_reachable(&mut self, reachable: bool) -> bool {
+        std::mem::replace(&mut self.reachable, reachable) != reachable
     }
 
     /// Record a newly read word. Returns `true` if the stored value has changed.

@@ -35,8 +35,6 @@ pub enum Error {
     LookupHost(#[source] std::io::Error, String),
     #[error("`{0}` did not resolve to any addresses")]
     NoAddresses(String),
-    #[error("could not connect to `{1}`")]
-    Connect(#[source] std::io::Error, SocketAddr),
     #[error("communication with the heat pump failed")]
     Request(#[from] RequestError),
     #[error("register {0:?} is not writable")]
@@ -90,12 +88,12 @@ pub struct PollGroup {
 /// A notification that something about the registers has changed.
 ///
 /// Sent after a read out or a write that turned something up, no matter how many registers it has
-/// covered.
+/// covered. Whether connections to the heat pump can be opened is news too.
 #[derive(Debug)]
 pub struct Update {
     /// The documented registers that have a new value. Registers that have never been seen before
     /// are considered to have changed. This is empty if the only news is that the heat pump has
-    /// nothing at some addresses.
+    /// nothing at some addresses, or whether connections to it can be opened.
     pub changed: Vec<Register>,
 }
 
@@ -142,8 +140,9 @@ impl Handle {
 pub struct Device {
     pub handle: Handle,
     pub updates: mpsc::UnboundedReceiver<Update>,
-    /// Completes when the connection fails or is closed.
-    pub task: tokio::task::JoinHandle<Result<(), Error>>,
+    /// Completes once all of the handles are gone. Problems with the connection to the heat pump
+    /// do not end it: the connections are made again as needed.
+    pub task: tokio::task::JoinHandle<()>,
 }
 
 enum Command {
@@ -168,20 +167,18 @@ async fn resolve(tcp: &str) -> Result<SocketAddr, Error> {
         .ok_or_else(|| Error::NoAddresses(tcp.to_owned()))
 }
 
-/// Connect to the heat pump, without polling anything.
-async fn connect_client(args: &Args, close_after: Duration) -> Result<Client, Error> {
+/// Set up the communication with the heat pump, without polling anything. The heat pump does not
+/// need to be reachable.
+async fn create_client(args: &Args, close_after: Duration) -> Result<Client, Error> {
     let address = resolve(&args.tcp).await?;
-    info!(%address, max_connections = args.max_connections, "connecting");
+    info!(%address, max_connections = args.max_connections, "heat pump address resolved");
     let max_connections = usize::from(args.max_connections);
-    let client =
-        Client::connect(address, args.unit_id, *args.timeout, max_connections, close_after)
-            .await
-            .map_err(|e| Error::Connect(e, address))?;
-    info!("connected");
-    Ok(client)
+    Ok(Client::new(address, args.unit_id, *args.timeout, max_connections, close_after))
 }
 
-/// Connect to the heat pump and start polling the registers.
+/// Start polling the registers of the heat pump.
+///
+/// The heat pump does not need to be reachable: the polls fail until it is.
 pub async fn connect(args: &Args, polls: Vec<PollGroup>) -> Result<Device, Error> {
     connect_polling(args, polls, RETRY_UNREADABLE_EVERY).await
 }
@@ -193,7 +190,7 @@ async fn connect_polling(
 ) -> Result<Device, Error> {
     // Every connection that a poll needs gets used at least once per period, so it stays open.
     let longest_period = polls.iter().map(|poll| poll.period).max().unwrap_or_default();
-    let client = connect_client(args, 2 * longest_period).await?;
+    let client = create_client(args, 2 * longest_period).await?;
 
     let snapshot = Arc::new(RwLock::new(Snapshot::new()));
     let (update_tx, updates) = mpsc::unbounded_channel();
@@ -245,6 +242,12 @@ fn halves(read: Read) -> [Read; 2] {
 
 fn is_missing_address(error: &RequestError) -> bool {
     matches!(error, RequestError::Exception(_, ExceptionCode::ILLEGAL_DATA_ADDRESS))
+}
+
+/// Whether a connection to the heat pump could not be opened, as opposed to the heat pump failing to
+/// respond properly on the connection that was opened.
+fn failed_to_connect(error: &RequestError) -> bool {
+    matches!(error, RequestError::Connect(_))
 }
 
 /// Read a range of addresses, and find out what can be read out of it if it can not be read as a
@@ -374,7 +377,7 @@ struct Worker {
 }
 
 impl Worker {
-    async fn run(mut self, mut commands: mpsc::UnboundedReceiver<Command>) -> Result<(), Error> {
+    async fn run(mut self, mut commands: mpsc::UnboundedReceiver<Command>) {
         let mut in_progress: FuturesUnordered<InProgress> = FuturesUnordered::new();
         loop {
             let polls_due = self.groups.iter().filter(|g| !g.running).map(|g| g.next_due);
@@ -383,7 +386,7 @@ impl Worker {
                 biased;
                 command = commands.recv() => {
                     // All of the handles are gone, so nobody is interested in this anymore.
-                    let Some(command) = command else { return Ok(()) };
+                    let Some(command) = command else { return };
                     match command {
                         Command::Write { writes, reply } => {
                             let client = Arc::clone(&self.client);
@@ -393,8 +396,8 @@ impl Worker {
                 }
                 done = in_progress.next(), if !in_progress.is_empty() => {
                     match done.expect("there is something in progress") {
-                        Done::Read(finished) => self.finish(finished)?,
-                        Done::Write(written) => self.finish_write(written)?,
+                        Done::Read(finished) => self.finish(finished),
+                        Done::Write(written) => self.finish_write(written),
                     }
                 }
                 _ = tokio::time::sleep_until(wake_up.expect("there is always the retry")) => {
@@ -431,8 +434,11 @@ impl Worker {
     }
 
     /// Store the outcome of a read out in the snapshot, and schedule the next one.
-    fn finish(&mut self, finished: Finished) -> Result<(), Error> {
+    fn finish(&mut self, finished: Finished) {
         let Finished { group: index, started, reads, results } = finished;
+        // There is nothing to learn from a read out that has not asked for anything.
+        let reachable = (!results.is_empty())
+            .then(|| !results.iter().all(|result| result.as_ref().is_err_and(failed_to_connect)));
         let mut changed = Vec::new();
         let mut failed = false;
         let mut discovered = Vec::new();
@@ -449,19 +455,27 @@ impl Worker {
                     self.apply_pairs(read.space, &words, &mut changed);
                     discovered.extend(outcome.unreadable.into_iter().map(|a| (read.space, a)));
                 }
-                // The heat pump didn't like this for some reason that isn't about the addresses.
-                Err(RequestError::Exception(request, code)) => {
+                // The heat pump didn't like this for some reason that isn't about the addresses,
+                // or there was no connection to it. It is tried again with the next poll.
+                Err(e) => {
                     failed = true;
                     if !self.groups[index].failing {
-                        warn!(?code, %request, "the heat pump rejected a request");
+                        warn!(
+                            error = (&e as &dyn std::error::Error),
+                            period = ?self.groups[index].period,
+                            "could not read out the registers"
+                        );
                     }
                 }
-                Err(e) => return Err(e.into()),
             }
         }
         let discovered = self.note_unreadable(discovered);
+        let reachability = reachable.is_some_and(|reachable| self.note_reachable(reachable));
         let group = &mut self.groups[index];
         group.running = false;
+        if group.failing && !failed {
+            info!(period = ?group.period, "the registers can be read out again");
+        }
         group.failing = failed;
         let took = started.elapsed();
         if took > group.period {
@@ -481,12 +495,16 @@ impl Worker {
         // Don't try to catch up if we've fallen behind.
         group.next_due = (group.next_due + group.period).max(Instant::now());
         // Finding out that there is nothing at an address is news, too. Those waiting for the
-        // register to appear can stop waiting.
-        if !changed.is_empty() || discovered {
+        // register to appear can stop waiting. So is whether the heat pump can be connected to.
+        if !changed.is_empty() || discovered || reachability {
             debug!(count = changed.len(), ?took, discovered, "registers changed");
             let _ = self.updates.send(Update { changed });
         }
-        Ok(())
+    }
+
+    /// Remember whether connections to the heat pump can be opened. Returns whether this is news.
+    fn note_reachable(&self, reachable: bool) -> bool {
+        self.snapshot.write().unwrap_or_else(|e| e.into_inner()).set_reachable(reachable)
     }
 
     /// Remember the addresses that were found to not be there, and stop asking for them.
@@ -532,33 +550,23 @@ impl Worker {
     }
 
     /// Store what has been read back after writing, and let the writer know.
-    fn finish_write(&mut self, written: Written) -> Result<(), Error> {
+    fn finish_write(&mut self, written: Written) {
         let Written { writes, reply, at, result } = written;
+        let unconnected = matches!(&result, Err(Error::Request(e)) if failed_to_connect(e));
+        let reachability = self.note_reachable(!unconnected);
         for (register, _) in &writes {
             self.written.insert((register.space(), register.address()), at);
         }
-        match result {
-            Ok(words) => {
-                let mut changed = Vec::new();
-                for (&(register, _), words) in writes.iter().zip(&words) {
-                    self.apply(register.space(), register.address(), words, &mut changed);
-                }
-                if !changed.is_empty() {
-                    let _ = self.updates.send(Update { changed });
-                }
-                let _ = reply.send(Ok(()));
-                Ok(())
+        let mut changed = Vec::new();
+        let outcome = result.map(|words| {
+            for (&(register, _), words) in writes.iter().zip(&words) {
+                self.apply(register.space(), register.address(), words, &mut changed);
             }
-            // The connection is not to be relied upon after this.
-            Err(Error::Request(e @ (RequestError::Transport(_) | RequestError::Timeout))) => {
-                let _ = reply.send(Err(Error::Closed));
-                Err(Error::Request(e))
-            }
-            Err(e) => {
-                let _ = reply.send(Err(e));
-                Ok(())
-            }
+        });
+        if !changed.is_empty() || reachability {
+            let _ = self.updates.send(Update { changed });
         }
+        let _ = reply.send(outcome);
     }
 }
 
@@ -615,6 +623,11 @@ mod tests {
     /// never responded to. Responses come `delay` after the latest request. Connections do not
     /// affect each other. With `slow_stale_reads`, reading the holding registers takes three times
     /// as long until something has been written to any of them.
+    ///
+    /// The `Counters` also control what goes wrong: it can be `silent` or `dropping` connections,
+    /// `refusing` them (and hanging up on the ones that are open, as if the heat pump had gone
+    /// away), close the connections that have been idle for `close_idle_after_ms`, and make the
+    /// input registers `ticking` (change with every read.)
     async fn fake_heat_pump_with(
         delay: Duration,
         slow_stale_reads: bool,
@@ -624,49 +637,103 @@ mod tests {
         let counters = Arc::new(Counters::default());
         let seen = Arc::clone(&counters);
         tokio::spawn(async move {
+            let mut refusing = seen.refusing.subscribe();
+            let mut listener = Some(listener);
             loop {
-                let (socket, _) = listener.accept().await.unwrap();
-                seen.connections.fetch_add(1, SeqCst);
-                let seen = Arc::clone(&seen);
-                let (mut reader, mut writer) = socket.into_split();
-                tokio::spawn(async move {
-                    let (mut received, mut chunk) = (Vec::new(), [0; 64]);
-                    // The one request that is going to be responded to, and when.
-                    let mut pending: Option<(Instant, Vec<u8>)> = None;
-                    loop {
-                        let due = pending.as_ref().map(|(at, _)| *at);
-                        tokio::select! {
-                            read = reader.read(&mut chunk) => {
-                                let read = read.unwrap_or(0);
-                                if read == 0 {
-                                    seen.closed.fetch_add(1, SeqCst);
-                                    return;
-                                }
-                                received.extend(&chunk[..read]);
-                                while received.len() >= 12 {
-                                    let request: Vec<u8> = received.drain(..12).collect();
-                                    if pending.is_some() {
-                                        seen.replaced.fetch_add(1, SeqCst);
-                                    }
-                                    let (delay, response) = answer(&seen, &request, delay, slow_stale_reads);
-                                    pending = Some((Instant::now() + delay, response));
-                                }
+                if *refusing.borrow_and_update() {
+                    // Nothing listens at the address, so the connections are refused.
+                    listener = None;
+                    refusing.wait_for(|refusing| !refusing).await.unwrap();
+                }
+                let listener = match &listener {
+                    Some(listener) => listener,
+                    None => {
+                        let bound = tokio::net::TcpListener::bind(address).await.unwrap();
+                        listener.insert(bound)
+                    }
+                };
+                // Dropped, and so hung up on, once the heat pump is told to go away.
+                let mut connections = tokio::task::JoinSet::new();
+                loop {
+                    tokio::select! {
+                        _ = refusing.changed() => break,
+                        accepted = listener.accept() => {
+                            let (socket, _) = accepted.unwrap();
+                            seen.connections.fetch_add(1, SeqCst);
+                            if seen.dropping.load(SeqCst) {
+                                seen.unanswered.fetch_add(1, SeqCst);
+                                continue;
                             }
-                            _ = async {
-                                match due {
-                                    Some(due) => tokio::time::sleep_until(due).await,
-                                    None => std::future::pending().await,
-                                }
-                            } => {
-                                let (_, response) = pending.take().unwrap();
-                                let _ = writer.write_all(&response).await;
-                            }
+                            let seen = Arc::clone(&seen);
+                            connections.spawn(serve_connection(socket, seen, delay, slow_stale_reads));
                         }
                     }
-                });
+                }
             }
         });
         (address, counters)
+    }
+
+    async fn serve_connection(
+        socket: tokio::net::TcpStream,
+        seen: Arc<Counters>,
+        delay: Duration,
+        slow_stale_reads: bool,
+    ) {
+        let (mut reader, mut writer) = socket.into_split();
+        let (mut received, mut chunk) = (Vec::new(), [0; 64]);
+        // The one request that is going to be responded to, and when.
+        let mut pending: Option<(Instant, Vec<u8>)> = None;
+        let mut last_active = Instant::now();
+        loop {
+            let idle_close = Duration::from_millis(seen.close_idle_after_ms.load(SeqCst));
+            let closes_at =
+                (pending.is_none() && !idle_close.is_zero()).then(|| last_active + idle_close);
+            let due = pending.as_ref().map(|(at, _)| *at);
+            tokio::select! {
+                read = reader.read(&mut chunk) => {
+                    let read = read.unwrap_or(0);
+                    if read == 0 {
+                        seen.closed.fetch_add(1, SeqCst);
+                        return;
+                    }
+                    received.extend(&chunk[..read]);
+                    last_active = Instant::now();
+                    while received.len() >= 12 {
+                        let request: Vec<u8> = received.drain(..12).collect();
+                        if seen.dropping.load(SeqCst) {
+                            seen.unanswered.fetch_add(1, SeqCst);
+                            return;
+                        }
+                        if seen.silent.load(SeqCst) {
+                            seen.unanswered.fetch_add(1, SeqCst);
+                            continue;
+                        }
+                        if pending.is_some() {
+                            seen.replaced.fetch_add(1, SeqCst);
+                        }
+                        let (delay, response) = answer(&seen, &request, delay, slow_stale_reads);
+                        pending = Some((Instant::now() + delay, response));
+                    }
+                }
+                _ = async {
+                    match due {
+                        Some(due) => tokio::time::sleep_until(due).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    let (_, response) = pending.take().unwrap();
+                    let _ = writer.write_all(&response).await;
+                    last_active = Instant::now();
+                }
+                () = async {
+                    match closes_at {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                } => return,
+            }
+        }
     }
 
     /// What the heat pump responds to a request with, and how long it takes.
@@ -715,6 +782,9 @@ mod tests {
                 let written = seen.written.lock().unwrap().get(&address).copied();
                 let word = match (function, written) {
                     (3, Some(word)) => word,
+                    (4, _) if seen.ticking.load(SeqCst) => {
+                        (address + 1000 * 4).wrapping_add(seen.requests() as u16)
+                    }
                     _ => address + 1000 * u16::from(function),
                 };
                 pdu.extend(word.to_be_bytes());
@@ -744,6 +814,18 @@ mod tests {
         rejected: std::sync::atomic::AtomicUsize,
         /// Whether the addresses that are rejected are there now.
         healed: std::sync::atomic::AtomicBool,
+        /// Whether the requests are received and not responded to.
+        silent: std::sync::atomic::AtomicBool,
+        /// Whether the connections are closed instead of being served.
+        dropping: std::sync::atomic::AtomicBool,
+        /// Whether the heat pump is gone: the open connections are closed, and new ones refused.
+        refusing: tokio::sync::watch::Sender<bool>,
+        /// How many connections and requests were not served because of `silent` and `dropping`.
+        unanswered: std::sync::atomic::AtomicUsize,
+        /// Connections that have not been used for this many milliseconds are closed. Never if 0.
+        close_idle_after_ms: std::sync::atomic::AtomicU64,
+        /// Whether the input registers have a different value for every read.
+        ticking: std::sync::atomic::AtomicBool,
         /// What has been written to the holding registers.
         written: Mutex<std::collections::HashMap<u16, u16>>,
     }
@@ -768,11 +850,23 @@ mod tests {
         fn replaced(&self) -> usize {
             self.replaced.load(SeqCst)
         }
+
+        fn unanswered(&self) -> usize {
+            self.unanswered.load(SeqCst)
+        }
+
+        fn refuse(&self, on: bool) {
+            self.refusing.send_replace(on);
+        }
     }
 
     fn args(address: SocketAddr, more: &[&str]) -> Args {
+        args_with_timeout(address, "2s", more)
+    }
+
+    fn args_with_timeout(address: SocketAddr, timeout: &str, more: &[&str]) -> Args {
         let tcp = address.to_string();
-        let mut args = vec!["test", "--tcp", &tcp, "--timeout", "2s"];
+        let mut args = vec!["test", "--tcp", &tcp, "--timeout", timeout];
         args.extend(more);
         Args::parse_from(args)
     }
@@ -824,7 +918,7 @@ mod tests {
     async fn concurrent_requests_are_served_in_parallel_over_several_connections() {
         let delay = Duration::from_millis(300);
         let (address, counters) = fake_heat_pump(delay).await;
-        let client = connect_client(&args(address, &[]), Duration::from_secs(60)).await.unwrap();
+        let client = create_client(&args(address, &[]), Duration::from_secs(60)).await.unwrap();
 
         // Four requests taking 300 ms each. One after another that would be 1.2 seconds.
         let started = Instant::now();
@@ -848,7 +942,7 @@ mod tests {
     #[tokio::test]
     async fn requests_one_after_another_share_a_connection() {
         let (address, counters) = fake_heat_pump(Duration::from_millis(20)).await;
-        let client = connect_client(&args(address, &[]), Duration::from_secs(60)).await.unwrap();
+        let client = create_client(&args(address, &[]), Duration::from_secs(60)).await.unwrap();
         for _ in 0..5 {
             assert_eq!(client.read(Space::Input, 13, 1).await.unwrap(), [4013]);
         }
@@ -862,7 +956,7 @@ mod tests {
         let delay = Duration::from_millis(100);
         let (address, counters) = fake_heat_pump(delay).await;
         let client =
-            connect_client(&args(address, &["--max-connections", "1"]), Duration::from_secs(60))
+            create_client(&args(address, &["--max-connections", "1"]), Duration::from_secs(60))
                 .await
                 .unwrap();
 
@@ -883,9 +977,7 @@ mod tests {
         // Reading the holding registers takes 150 ms, which is too long.
         let (address, counters) = fake_heat_pump_with(Duration::from_millis(50), true).await;
         let client =
-            Client::connect(address, 1, Duration::from_millis(100), 1, Duration::from_secs(60))
-                .await
-                .unwrap();
+            Client::new(address, 1, Duration::from_millis(100), 1, Duration::from_secs(60));
 
         let slow = client.read(Space::Holding, 22, 1).await;
         assert!(matches!(slow, Err(RequestError::Timeout)), "{slow:?}");
@@ -898,10 +990,7 @@ mod tests {
     #[tokio::test]
     async fn connections_opened_in_a_race_are_kept_for_later() {
         let (address, counters) = fake_heat_pump(Duration::ZERO).await;
-        let client =
-            Client::connect(address, 1, Duration::from_secs(2), 8, Duration::from_secs(60))
-                .await
-                .unwrap();
+        let client = Client::new(address, 1, Duration::from_secs(2), 8, Duration::from_secs(60));
 
         // Requests that find no idle connection open one, and are served by whichever connection
         // comes first. Which it is varies, and either way the other is not for throwing away.
@@ -929,8 +1018,7 @@ mod tests {
     async fn connections_that_are_no_longer_needed_are_closed() {
         let (address, counters) = fake_heat_pump(Duration::from_millis(50)).await;
         let close_after = Duration::from_millis(300);
-        let client =
-            Client::connect(address, 1, Duration::from_secs(2), 8, close_after).await.unwrap();
+        let client = Client::new(address, 1, Duration::from_secs(2), 8, close_after);
         let reads = (0..4).map(|_| client.read(Space::Input, 13, 1));
         for result in futures::future::join_all(reads).await {
             assert_eq!(result.unwrap(), [4013]);
@@ -1109,5 +1197,193 @@ mod tests {
         assert_eq!(update.changed, [Register::input(319)]);
         assert_eq!(device.handle.snapshot().raw(Space::Input, 319), Some(4319));
         assert!(!device.handle.snapshot().is_unreadable(Register::input(319)));
+    }
+
+    #[tokio::test]
+    async fn a_connection_closed_while_idle_does_not_fail_the_request() {
+        let (address, counters) = fake_heat_pump(Duration::ZERO).await;
+        counters.close_idle_after_ms.store(50, SeqCst);
+        let client = create_client(&args(address, &[]), Duration::from_secs(60)).await.unwrap();
+        assert_eq!(client.read(Space::Input, 13, 1).await.unwrap(), [4013]);
+
+        for _ in 0..3 {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert_eq!(client.read(Space::Input, 13, 1).await.unwrap(), [4013]);
+        }
+        // Every time the connection was gone, and another one was used instead.
+        assert_eq!(counters.connections(), 4);
+    }
+
+    #[tokio::test]
+    async fn all_of_the_connections_closed_while_idle_are_gotten_through() {
+        let (address, counters) = fake_heat_pump(Duration::from_millis(100)).await;
+        counters.close_idle_after_ms.store(50, SeqCst);
+        let client = create_client(&args(address, &[]), Duration::from_secs(60)).await.unwrap();
+        let reads = (0..4).map(|_| client.read(Space::Input, 13, 1));
+        for result in futures::future::join_all(reads).await {
+            assert_eq!(result.unwrap(), [4013]);
+        }
+        assert!(counters.connections() >= 3);
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(client.read(Space::Input, 13, 1).await.unwrap(), [4013]);
+    }
+
+    #[tokio::test]
+    async fn a_heat_pump_that_rejects_the_requests_is_reachable() {
+        // The fake heat pump has nothing at input register 319.
+        let (address, _) = fake_heat_pump(Duration::ZERO).await;
+        let polls = vec![PollGroup {
+            period: Duration::from_millis(50),
+            registers: vec![Register::input(319)],
+        }];
+        let mut device = connect(&args(address, &[]), polls).await.unwrap();
+        device.updates.recv().await.unwrap();
+        assert!(device.handle.snapshot().reachable());
+    }
+
+    #[tokio::test]
+    async fn polling_is_not_disturbed_by_the_heat_pump_closing_idle_connections() {
+        let (address, counters) = fake_heat_pump(Duration::ZERO).await;
+        // The connection is gone every time before the next poll.
+        counters.close_idle_after_ms.store(50, SeqCst);
+        counters.ticking.store(true, SeqCst);
+        let period = Duration::from_millis(200);
+        let polls = vec![PollGroup { period, registers: vec![Register::input(13)] }];
+        let mut device = connect(&args(address, &[]), polls).await.unwrap();
+
+        // Every poll brings news, if it works. One that fails costs a whole period.
+        let mut updates = 0;
+        let deadline = Instant::now() + period * 6;
+        while let Ok(update) = tokio::time::timeout_at(deadline, device.updates.recv()).await {
+            update.unwrap();
+            updates += 1;
+        }
+        assert!(updates >= 5, "{updates} updates");
+        assert!(!device.task.is_finished());
+    }
+
+    /// The heat pump has trouble for a while, with `outage` starting and ending it. Polling goes on
+    /// and picks up where it was. `unreachable` is whether the trouble is that no connection can be
+    /// made: otherwise the heat pump is where it was, even if it does not respond properly.
+    async fn polling_survives_the_outage(outage: impl Fn(&Counters, bool), unreachable: bool) {
+        let (address, counters) = fake_heat_pump(Duration::ZERO).await;
+        let polls = vec![PollGroup {
+            period: Duration::from_millis(50),
+            registers: vec![Register::input(13)],
+        }];
+        let args = args_with_timeout(address, "200ms", &[]);
+        let mut device = connect(&args, polls).await.unwrap();
+        let update = device.updates.recv().await.unwrap();
+        assert_eq!(update.changed, [Register::input(13)]);
+        assert!(device.handle.snapshot().reachable());
+        assert_eq!(device.handle.snapshot().raw(Space::Input, 13), Some(4013));
+
+        outage(&counters, true);
+        if unreachable {
+            // Nothing has changed in the registers, and that the heat pump is gone is still news.
+            let update = tokio::time::timeout(Duration::from_secs(5), device.updates.recv())
+                .await
+                .expect("the outage is not reported")
+                .unwrap();
+            assert!(update.changed.is_empty(), "{update:?}");
+            assert!(!device.handle.snapshot().reachable());
+        } else {
+            // Long enough for several polls to fail, each of which takes a while.
+            let update = tokio::time::timeout(Duration::from_secs(1), device.updates.recv()).await;
+            assert!(update.is_err(), "unexpected notification: {update:?}");
+            assert!(counters.unanswered() > 0);
+            assert!(device.handle.snapshot().reachable());
+        }
+        assert!(!device.task.is_finished());
+
+        outage(&counters, false);
+        if unreachable {
+            let update = tokio::time::timeout(Duration::from_secs(5), device.updates.recv())
+                .await
+                .expect("polling does not resume once the heat pump is back")
+                .unwrap();
+            assert!(update.changed.is_empty(), "{update:?}");
+            assert!(device.handle.snapshot().reachable());
+        }
+        counters.ticking.store(true, SeqCst);
+        let update = tokio::time::timeout(Duration::from_secs(5), device.updates.recv())
+            .await
+            .expect("polling does not go on")
+            .unwrap();
+        assert_eq!(update.changed, [Register::input(13)]);
+        assert!(device.handle.snapshot().reachable());
+        assert!(!device.task.is_finished());
+    }
+
+    #[tokio::test]
+    async fn polling_survives_the_heat_pump_dropping_connections() {
+        let outage = |counters: &Counters, on| counters.dropping.store(on, SeqCst);
+        polling_survives_the_outage(outage, false).await;
+    }
+
+    #[tokio::test]
+    async fn polling_survives_the_heat_pump_not_responding() {
+        let outage = |counters: &Counters, on| counters.silent.store(on, SeqCst);
+        polling_survives_the_outage(outage, false).await;
+    }
+
+    #[tokio::test]
+    async fn polling_survives_the_heat_pump_going_away() {
+        let outage = |counters: &Counters, on| counters.refuse(on);
+        polling_survives_the_outage(outage, true).await;
+    }
+
+    #[tokio::test]
+    async fn a_write_that_the_heat_pump_does_not_respond_to_fails_and_the_worker_goes_on() {
+        let (address, counters) = fake_heat_pump(Duration::ZERO).await;
+        let polls = vec![PollGroup {
+            period: Duration::from_secs(3600),
+            registers: vec![Register::holding(22)],
+        }];
+        let args = args_with_timeout(address, "200ms", &[]);
+        let mut device = connect(&args, polls).await.unwrap();
+        device.updates.recv().await.unwrap();
+        assert!(device.handle.snapshot().reachable());
+
+        counters.silent.store(true, SeqCst);
+        let write = device.handle.write(vec![(Register::holding(22), 4550)]).await;
+        assert!(matches!(write, Err(Error::Request(RequestError::Timeout))), "{write:?}");
+        // It is there, it just does not respond.
+        assert!(device.handle.snapshot().reachable());
+        assert!(!device.task.is_finished());
+
+        counters.silent.store(false, SeqCst);
+        device.handle.write(vec![(Register::holding(22), 4550)]).await.unwrap();
+        assert_eq!(device.handle.snapshot().raw(Space::Holding, 22), Some(4550));
+        assert!(device.handle.snapshot().reachable());
+        assert!(!device.task.is_finished());
+    }
+
+    #[tokio::test]
+    async fn a_write_that_cannot_reach_the_heat_pump_fails_and_the_worker_goes_on() {
+        let (address, counters) = fake_heat_pump(Duration::ZERO).await;
+        let polls = vec![PollGroup {
+            period: Duration::from_secs(3600),
+            registers: vec![Register::holding(22)],
+        }];
+        let mut device = connect(&args(address, &[]), polls).await.unwrap();
+        device.updates.recv().await.unwrap();
+        assert!(device.handle.snapshot().reachable());
+
+        counters.refuse(true);
+        let write = device.handle.write(vec![(Register::holding(22), 4550)]).await;
+        assert!(matches!(write, Err(Error::Request(RequestError::Connect(_)))), "{write:?}");
+        // The write is how the heat pump was found to be gone, and that is news.
+        let update = device.updates.try_recv().expect("the outage is not reported");
+        assert!(update.changed.is_empty(), "{update:?}");
+        assert!(!device.handle.snapshot().reachable());
+        assert!(!device.task.is_finished());
+
+        counters.refuse(false);
+        device.handle.write(vec![(Register::holding(22), 4550)]).await.unwrap();
+        assert_eq!(device.handle.snapshot().raw(Space::Holding, 22), Some(4550));
+        assert!(device.handle.snapshot().reachable());
+        assert!(!device.task.is_finished());
     }
 }

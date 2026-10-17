@@ -26,8 +26,8 @@ use tokio::sync::mpsc;
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
-    #[error("could not publish the state init message")]
-    PublishStateInit(#[source] rumqttc::v5::ClientError),
+    #[error("could not publish the device state")]
+    PublishState(#[source] rumqttc::v5::ClientError),
     #[error("could not construct the device description")]
     BuildDeviceDescription(#[source] homie5::Homie5ProtocolError),
     #[error("could not publish the device description message")]
@@ -36,8 +36,6 @@ pub enum Error {
     ConstructTopicSubscriptions(#[source] homie5::Homie5ProtocolError),
     #[error("could not subscribe to the needed topics")]
     Subscribe(#[source] rumqttc::v5::ClientError),
-    #[error("could not publish the state ready message")]
-    PublishStateReady(#[source] rumqttc::v5::ClientError),
     #[error("unexpected homie device ID ({0}) encountered")]
     WrongDeviceId(HomieID),
     #[error("unknown node {0}")]
@@ -302,11 +300,7 @@ impl Device {
     async fn publish_state(&mut self, state: HomieDeviceStatus) -> Result<(), Error> {
         self.state = state;
         let p = self.protocol.publish_state(state);
-        let error = match state {
-            HomieDeviceStatus::Ready => Error::PublishStateReady,
-            _ => Error::PublishStateInit,
-        };
-        self.mqtt.homie_publish(p).await.map_err(error)
+        self.mqtt.homie_publish(p).await.map_err(Error::PublishState)
     }
 
     /// Wait until every register we need has been read, or is known to be missing from the heat
@@ -372,36 +366,41 @@ impl Device {
         Ok(())
     }
 
-    pub(crate) async fn publish_device(&mut self) -> Result<(), Error> {
+    /// Publish the description and the values of the properties, and subscribe to the settable ones.
+    ///
+    /// The first time around this waits for the registers to be read out, as the description
+    /// depends on what the heat pump has to say. The description may only change while the device
+    /// is not `ready`.
+    async fn republish(&mut self) -> Result<(), Error> {
         self.publish_state(HomieDeviceStatus::Init).await?;
-        // The description depends on what the heat pump has to say.
-        self.wait_for_registers().await?;
-        self.available = self.compute_availability();
-        for (node, available) in self.nodes.iter().zip(&self.available) {
-            for (property, _) in node.properties.iter().zip(available).filter(|(_, a)| !**a) {
-                tracing::info!(
-                    node_id = %node.id,
-                    prop_id = %property.prop_id,
-                    "the heat pump has no value for the property, it is not described"
-                );
+        if self.description.nodes.is_empty() {
+            self.wait_for_registers().await?;
+            self.available = self.compute_availability();
+            for (node, available) in self.nodes.iter().zip(&self.available) {
+                for (property, _) in node.properties.iter().zip(available).filter(|(_, a)| !**a) {
+                    tracing::info!(
+                        node_id = %node.id,
+                        prop_id = %property.prop_id,
+                        "the heat pump has no value for the property, it is not described"
+                    );
+                }
             }
         }
         self.publish_properties().await?;
         self.subscribe().await?;
-        self.publish_state(HomieDeviceStatus::Ready).await?;
-        tracing::debug!("device became ready...");
+        self.publish_state(self.state_for_reachability()).await?;
+        tracing::debug!("device published...");
         Ok(())
     }
 
-    /// Describe the properties again, as some have gained their values.
-    ///
-    /// The description may only change while the device is not `ready`.
-    async fn reconfigure(&mut self) -> Result<(), Error> {
-        tracing::info!("more properties have values now, describing the device again");
-        self.publish_state(HomieDeviceStatus::Init).await?;
-        self.publish_properties().await?;
-        self.subscribe().await?;
-        self.publish_state(HomieDeviceStatus::Ready).await
+    /// `ready` for as long as connections to the heat pump can be opened, as the values are stale
+    /// otherwise.
+    fn state_for_reachability(&self) -> HomieDeviceStatus {
+        if self.modbus.snapshot().reachable() {
+            HomieDeviceStatus::Ready
+        } else {
+            HomieDeviceStatus::Disconnected
+        }
     }
 
     /// Publish the current value of a property, if it is a different one from what we have
@@ -475,7 +474,8 @@ impl Device {
         // Registers that could not be read earlier may have been read since.
         let current = self.compute_availability();
         if grow(&mut self.available, &current) {
-            return self.reconfigure().await;
+            tracing::info!("more properties have values now, describing the device again");
+            return self.republish().await;
         }
         let changed: HashSet<Register> = update.changed.into_iter().collect();
         // We don't try to be smart: anything that depends on a register that has changed is
@@ -488,15 +488,26 @@ impl Device {
                 }
             }
         }
+        // When the heat pump goes away and comes back there is no new description to publish, so
+        // this is all that changes. Until the device has been described it stays `init`.
+        if matches!(self.state, HomieDeviceStatus::Ready | HomieDeviceStatus::Disconnected) {
+            let state = self.state_for_reachability();
+            if state != self.state {
+                self.publish_state(state).await?;
+            }
+        }
         Ok(())
     }
 
     async fn handle_command(&mut self, command: Command) -> Result<(), Error> {
-        if self.state != HomieDeviceStatus::Ready {
-            tracing::debug!(?command, "command ignored, device is not ready yet");
-            return Ok(());
-        }
-        let Command::Set { property, value } = command;
+        let (property, value) = match command {
+            Command::Republish => return self.republish().await,
+            Command::Set { .. } if self.state != HomieDeviceStatus::Ready => {
+                tracing::debug!(?command, "command ignored, device is not ready");
+                return Ok(());
+            }
+            Command::Set { property, value } => (property, value),
+        };
         if !self.args.allow_writes {
             tracing::warn!(?property, "ignoring a set command, writes are not allowed");
             return Ok(());
@@ -621,6 +632,7 @@ pub fn convert_qos(homie: QoS) -> rumqttc::v5::mqttbytes::QoS {
 #[derive(Debug)]
 pub(crate) enum Command {
     Set { property: PropertyRef, value: String },
+    Republish,
 }
 
 impl Command {
@@ -698,6 +710,7 @@ mod tests {
         let (_, updates) = mpsc::unbounded_channel();
         let (_, commands) = mpsc::unbounded_channel();
         let handle = modbus::Handle::detached(snapshot);
+        handle.snapshot_mut().set_reachable(true);
         (Device::new(args, client, protocol, nodes, handle, updates, commands), events)
     }
 
@@ -936,10 +949,10 @@ mod tests {
             [(Space::Input, 27, 20000), (Space::Input, 121, 2000), (Space::Holding, 118, 20000)];
         let words = all_registers(&args, &sensors_missing);
         let (mut missing, _events) = test_device(args.clone(), snapshot(&words));
-        missing.publish_device().await.unwrap();
+        missing.republish().await.unwrap();
         let words = all_registers(&args, &[]);
         let (mut present, _events) = test_device(args.clone(), snapshot(&words));
-        present.publish_device().await.unwrap();
+        present.republish().await.unwrap();
 
         for (node, prop) in [
             ("system", "room-temperature"),
@@ -959,7 +972,7 @@ mod tests {
         let args = default_args();
         let words = all_registers(&args, &[]);
         let (mut device, _events) = test_device(args, snapshot(&words));
-        device.publish_device().await.unwrap();
+        device.republish().await.unwrap();
         assert_eq!(device.state, HomieDeviceStatus::Ready);
 
         // The heat pump now reports "not connected" for the room sensor, which is 200.0 °C.
@@ -974,13 +987,42 @@ mod tests {
         let args = default_args();
         let words = all_registers(&args, &[(Space::Input, 121, 2000)]);
         let (mut device, _events) = test_device(args, snapshot(&words));
-        device.publish_device().await.unwrap();
+        device.republish().await.unwrap();
         assert!(!is_described(&device.description, "system", "room-temperature"));
 
         device.modbus.snapshot_mut().set(Space::Input, 121, 215);
         device.handle_update(Update { changed: vec![Register::input(121)] }).await.unwrap();
         assert_eq!(device.state, HomieDeviceStatus::Ready);
         assert!(is_described(&device.description, "system", "room-temperature"));
+    }
+
+    #[tokio::test]
+    async fn the_device_is_disconnected_while_the_heat_pump_is_unreachable() {
+        let args = Args::parse_from(["test", "--allow-writes"]);
+        let words = all_registers(&args, &[]);
+        let (mut device, _events) = test_device(args, snapshot(&words));
+        let set_mode = || {
+            let [device, node, prop] = ["thermia", "system", "mode"].map(|id| id.parse().unwrap());
+            let property = PropertyRef::new(homie5::HomieDomain::Default, device, node, prop);
+            Command::Set { property, value: "on".into() }
+        };
+        let update = || Update { changed: Vec::new() };
+
+        device.modbus.snapshot_mut().set_reachable(false);
+        device.republish().await.unwrap();
+        assert_eq!(device.state, HomieDeviceStatus::Disconnected);
+        device.handle_command(set_mode()).await.unwrap();
+        assert!(device.sets.is_empty());
+
+        device.modbus.snapshot_mut().set_reachable(true);
+        device.handle_update(update()).await.unwrap();
+        assert_eq!(device.state, HomieDeviceStatus::Ready);
+        device.handle_command(set_mode()).await.unwrap();
+        assert_eq!(device.sets.len(), 1);
+
+        device.modbus.snapshot_mut().set_reachable(false);
+        device.handle_update(update()).await.unwrap();
+        assert_eq!(device.state, HomieDeviceStatus::Disconnected);
     }
 
     #[tokio::test]
@@ -1008,7 +1050,7 @@ mod tests {
         assert_eq!(value_of("alarms", "active", &snapshot).unwrap(), "[]");
 
         let (mut device, _events) = test_device(args, snapshot);
-        device.publish_device().await.unwrap();
+        device.republish().await.unwrap();
         assert!(is_described(&device.description, "alarms", "active"));
         assert!(is_described(&device.description, "power", "output"));
         assert!(!is_described(&device.description, "power-limit", "limit"));

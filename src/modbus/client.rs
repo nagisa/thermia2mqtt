@@ -61,6 +61,8 @@ impl std::fmt::Debug for ExceptionCode {
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
+    #[error("could not connect to the heat pump")]
+    Connect(#[source] std::io::Error),
     #[error("communication with the heat pump failed")]
     Transport(#[source] std::io::Error),
     #[error("the heat pump did not respond in time")]
@@ -73,6 +75,8 @@ pub enum Error {
 struct Connection {
     stream: TcpStream,
     next_transaction: u16,
+    /// Has completed an exchange.
+    used: bool,
     _slot: OwnedSemaphorePermit,
 }
 
@@ -86,7 +90,7 @@ impl Connection {
             .await
             .map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))??;
         stream.set_nodelay(true)?;
-        Ok(Connection { stream, next_transaction: 0, _slot: slot })
+        Ok(Connection { stream, next_transaction: 0, used: false, _slot: slot })
     }
 
     /// Send a request and wait for the response. Returns its PDU (function code and what follows.)
@@ -180,23 +184,19 @@ pub struct Client {
 }
 
 impl Client {
-    /// Connect, and keep the connection for the requests. More connections are opened when there
-    /// are requests waiting for one, up to `max_connections` of them. Connections that have not
-    /// been used for `close_after` are closed.
-    pub async fn connect(
+    /// Connections are opened when there are requests waiting for one, up to `max_connections` of
+    /// them. Connections that have not been used for `close_after` are closed.
+    pub fn new(
         address: SocketAddr,
         unit_id: u8,
         timeout: Duration,
         max_connections: usize,
         close_after: Duration,
-    ) -> std::io::Result<Client> {
+    ) -> Client {
         let slots = Arc::new(Semaphore::new(max_connections));
-        let slot = Arc::clone(&slots).try_acquire_owned().expect("there is at least one slot");
-        let connection = Connection::open(address, timeout, slot).await?;
         let pool = Arc::new(Pool::default());
-        pool.put(Ok(connection));
         let turn = tokio::sync::Mutex::new(());
-        Ok(Client { address, unit_id, timeout, max_connections, close_after, slots, pool, turn })
+        Client { address, unit_id, timeout, max_connections, close_after, slots, pool, turn }
     }
 
     fn release(&self, connection: Connection) {
@@ -272,6 +272,12 @@ impl Client {
     ///
     /// A connection is only used again if the heat pump has responded properly, which includes
     /// responding with an exception.
+    ///
+    /// The heat pump may close connections that have been idle for a while. This is found out by
+    /// failing to use one, so a request that fails that way on a connection that has been used
+    /// before is made again on another connection, for as long as there are connections like that.
+    /// A request that fails on a connection that was opened for it is not made again. That is fine
+    /// for the requests that are made here: they are reads and writes of single registers.
     async fn transact(
         &self,
         request: &Request,
@@ -279,14 +285,20 @@ impl Client {
         args: [u16; 2],
         valid: impl FnOnce(&[u8]) -> bool,
     ) -> Result<Vec<u8>, Error> {
-        let mut connection = self.acquire().await.map_err(Error::Transport)?;
-        let started = Instant::now();
-        let exchange = connection.exchange(self.unit_id, function, args);
-        let mut pdu = match tokio::time::timeout(self.timeout, exchange).await {
-            Ok(Ok(pdu)) => pdu,
-            Ok(Err(e)) => return Err(Error::Transport(e)),
-            Err(_) => return Err(Error::Timeout),
+        let (mut connection, started, mut pdu) = loop {
+            let mut connection = self.acquire().await.map_err(Error::Connect)?;
+            let started = Instant::now();
+            let exchange = connection.exchange(self.unit_id, function, args);
+            match tokio::time::timeout(self.timeout, exchange).await {
+                Ok(Ok(pdu)) => break (connection, started, pdu),
+                Ok(Err(e)) if connection.used && e.kind() != std::io::ErrorKind::InvalidData => {
+                    debug!(%request, error = %e, "the connection is gone, trying another one");
+                }
+                Ok(Err(e)) => return Err(Error::Transport(e)),
+                Err(_) => return Err(Error::Timeout),
+            }
         };
+        connection.used = true;
         debug!(%request, elapsed = ?started.elapsed(), "request completed");
         let code = pdu.remove(0);
         if code == function | 0x80 {
@@ -360,10 +372,7 @@ mod tests {
             _ => response(request, transaction(request), &[4, 2, 0, 7]),
         })
         .await;
-        let client =
-            Client::connect(address, 1, Duration::from_secs(2), 1, Duration::from_secs(60))
-                .await
-                .unwrap();
+        let client = Client::new(address, 1, Duration::from_secs(2), 1, Duration::from_secs(60));
 
         for _ in 0..3 {
             let failed = client.read(Space::Input, 1, 1).await;
@@ -380,5 +389,32 @@ mod tests {
         assert_eq!(client.read(Space::Input, 1, 1).await.unwrap(), [7]);
         // The exception has not cost the connection.
         assert_eq!(accepted.load(SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn a_bad_response_on_a_used_connection_is_not_retried() {
+        let transaction = |request: &[u8; 12]| u16::from_be_bytes([request[0], request[1]]);
+        let (address, accepted) = server(move |n, request| match n {
+            1 => vec![0; 7],
+            _ => response(request, transaction(request), &[4, 2, 0, 7]),
+        })
+        .await;
+        let client = Client::new(address, 1, Duration::from_secs(2), 1, Duration::from_secs(60));
+
+        assert_eq!(client.read(Space::Input, 1, 1).await.unwrap(), [7]);
+        let failed = client.read(Space::Input, 1, 1).await;
+        assert!(matches!(failed, Err(Error::Transport(_))), "{failed:?}");
+        assert_eq!(accepted.load(SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_connection_that_cannot_be_opened_is_not_a_transport_error() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let client = Client::new(address, 1, Duration::from_secs(2), 1, Duration::from_secs(60));
+
+        let failed = client.read(Space::Input, 1, 1).await;
+        assert!(matches!(failed, Err(Error::Connect(_))), "{failed:?}");
     }
 }

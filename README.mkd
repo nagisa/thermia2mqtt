@@ -49,7 +49,7 @@ by default), to make polling fast.
 ## Caveats
 
 * The guide does not say which registers are signed. Temperatures and a few others are treated as
-  signed (see `is_signed` in the generator.)
+  signed.
 * Not every heat pump has every register. If the heat pump rejects a request a warning is logged
   and the registers are left unpublished, which, as per the Homie convention, holds up the device
   from becoming ready.
