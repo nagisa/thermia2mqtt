@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpStream;
-use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::time::Instant;
 use tracing::debug;
 
@@ -129,44 +129,31 @@ impl Connection {
     }
 }
 
-/// The connections that are not in use, and what has become of a connection that could not be
-/// opened.
-#[derive(Default)]
-struct Idle {
-    /// The most recently used connection last. Those used less recently are not needed as much.
-    connections: Vec<(Connection, Instant)>,
-    failed: Option<std::io::Error>,
-}
-
 #[derive(Default)]
 struct Pool {
-    idle: Mutex<Idle>,
+    /// The connections that are not in use, the most recently used last. Those used less recently
+    /// are not needed as much.
+    idle: Mutex<Vec<(Connection, Instant)>>,
     changed: Notify,
 }
 
 impl Pool {
-    fn put(&self, connection: std::io::Result<Connection>) {
+    fn put(&self, connection: Connection) {
         let mut idle = self.idle.lock().unwrap_or_else(|e| e.into_inner());
-        match connection {
-            Ok(connection) => idle.connections.push((connection, Instant::now())),
-            Err(e) => idle.failed = Some(e),
-        }
+        idle.push((connection, Instant::now()));
         self.changed.notify_one();
     }
 
     /// The most recently used idle connection. Those that have not been used for `close_after` are
     /// closed.
-    fn take(&self, close_after: Duration) -> std::io::Result<Option<Connection>> {
+    fn take(&self, close_after: Duration) -> Option<Connection> {
         let mut idle = self.idle.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(e) = idle.failed.take() {
-            return Err(e);
-        }
-        let unused = idle.connections.partition_point(|(_, used)| used.elapsed() > close_after);
+        let unused = idle.partition_point(|(_, used)| used.elapsed() > close_after);
         if unused > 0 {
             debug!(count = unused, "closing the connections that are no longer needed");
-            idle.connections.drain(..unused);
+            idle.drain(..unused);
         }
-        Ok(idle.connections.pop().map(|(connection, _)| connection))
+        idle.pop().map(|(connection, _)| connection)
     }
 }
 
@@ -200,32 +187,44 @@ impl Client {
     }
 
     fn release(&self, connection: Connection) {
-        self.pool.put(Ok(connection));
+        self.pool.put(connection);
     }
 
     /// Get a connection: an idle one, or whichever of the connections that become idle and the one
     /// that is opened for the occasion comes first.
     async fn acquire(&self) -> std::io::Result<Connection> {
         let _turn = self.turn.lock().await;
-        let mut opening = false;
+        // Hears of the connection that this request has started opening if it cannot be opened.
+        let mut opening: Option<oneshot::Receiver<std::io::Error>> = None;
         loop {
-            if let Some(connection) = self.pool.take(self.close_after)? {
+            if let Some(connection) = self.pool.take(self.close_after) {
                 return Ok(connection);
             }
             tokio::select! {
                 biased;
                 () = self.pool.changed.notified() => {}
-                slot = Arc::clone(&self.slots).acquire_owned(), if !opening => {
-                    opening = true;
+                failure = async { opening.as_mut().expect("guarded").await }, if opening.is_some() => {
+                    match failure {
+                        Ok(e) => return Err(e),
+                        // It has been opened and is idle now.
+                        Err(_) => opening = None,
+                    }
+                }
+                slot = Arc::clone(&self.slots).acquire_owned(), if opening.is_none() => {
                     let slot = slot.expect("the semaphore is never closed");
                     let open = self.max_connections - self.slots.available_permits();
                     debug!(open, "opening another connection to the heat pump");
                     let (address, timeout) = (self.address, self.timeout);
-                    let pool = Arc::clone(&self.pool);
-                    // Nothing is cancelled if another connection gets used first. This one joins
-                    // the idle ones when it is ready.
+                    let (pool, (fail, failure)) = (Arc::clone(&self.pool), oneshot::channel());
+                    opening = Some(failure);
+                    // Nothing is cancelled if another connection gets used first: this one joins
+                    // the idle ones when it is ready. If it cannot be opened that is only news to
+                    // a request that is still waiting for it.
                     tokio::spawn(async move {
-                        pool.put(Connection::open(address, timeout, slot).await)
+                        match Connection::open(address, timeout, slot).await {
+                            Ok(connection) => pool.put(connection),
+                            Err(e) => drop(fail.send(e)),
+                        }
                     });
                 }
             }

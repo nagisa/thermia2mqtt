@@ -39,7 +39,7 @@ pub enum Error {
     Request(#[from] RequestError),
     #[error("register {0:?} is not writable")]
     NotWritable(Register),
-    #[error("the connection to the heat pump has been closed")]
+    #[error("the communication with the heat pump has ended")]
     Closed,
 }
 
@@ -458,14 +458,14 @@ impl Worker {
                 // The heat pump didn't like this for some reason that isn't about the addresses,
                 // or there was no connection to it. It is tried again with the next poll.
                 Err(e) => {
-                    failed = true;
-                    if !self.groups[index].failing {
+                    if !failed && !self.groups[index].failing {
                         warn!(
                             error = (&e as &dyn std::error::Error),
                             period = ?self.groups[index].period,
                             "could not read out the registers"
                         );
                     }
+                    failed = true;
                 }
             }
         }

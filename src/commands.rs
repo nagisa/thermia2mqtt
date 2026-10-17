@@ -216,7 +216,7 @@ pub mod mqtt {
         command_tx.send(Command::Republish).expect("the device holds on to the receiver");
         let mut failures = 0u32;
         let mut poll_not_before = Instant::now();
-        'step: loop {
+        loop {
             // SUBTLE: `step` is not cancellation safe -- it may be in the middle of publishing
             // the resulting changes (which can block on the MQTT request queue being full, and
             // that queue is only drained by `client_loop.poll()`.) Dropping it would lose some of
@@ -284,15 +284,11 @@ pub mod mqtt {
                     Event::Outgoing(_) => None,
                 };
                 if let Some(command) = command {
-                    let Ok(()) = command_tx.send(command) else {
-                        tracing::warn!("command channel gone, terminating");
-                        break 'step;
-                    };
+                    command_tx.send(command).expect("the device holds on to the receiver");
                 }
             };
             step_result.map_err(Error::DeviceStep)?;
         }
-        Ok(())
     }
 
     #[cfg(test)]
