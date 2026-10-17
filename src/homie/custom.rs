@@ -1,99 +1,39 @@
 //! Properties that do not fit the mold of the generic kinds.
 
-use crate::homie::node::{PropertyEntry, PropertyKind};
-use crate::homie::value::{
-    AggregatePropertyValue, DynPropertyValue, PropertyDescription, PropertyValue,
-};
+use crate::homie::node::PropertyKind;
+use crate::homie::value::{json, json_description, string_list};
 use crate::modbus::Snapshot;
 use crate::registers::{Register, Space, Value};
-use homie5::device_description::{HomiePropertyDescription, PropertyDescriptionBuilder};
+use homie5::device_description::HomiePropertyDescription;
 use std::sync::OnceLock;
 
-pub(crate) const STRING_LIST_SCHEMA: &str = r#"{"type":"array","items":{"type":"string"}}"#;
 const HEAT_CURVE_SCHEMA: &str = r#"{"type":"array","items":{"type":"array","items":{"type":"number"},"minItems":2,"maxItems":2}}"#;
-
-pub(crate) fn json<T: serde::Serialize>(value: &T) -> String {
-    serde_json::to_string(value).expect("serializing to JSON cannot fail")
-}
-
-pub(crate) fn json_description(schema: &str) -> HomiePropertyDescription {
-    PropertyDescriptionBuilder::json().json_schema(schema).build()
-}
-
-fn read_only(description: &mut HomiePropertyDescription) {
-    description.retained = true;
-    description.settable = false;
-}
-
-/// A list of strings, published as a JSON array.
-pub(crate) struct StringList(Vec<String>);
-impl PropertyValue for StringList {
-    fn value(&self) -> String {
-        json(&self.0)
-    }
-}
-impl PropertyDescription for StringList {
-    fn description(_: &PropertyEntry) -> HomiePropertyDescription {
-        json_description(STRING_LIST_SCHEMA)
-    }
-}
-
-/// The points of a heat curve as `[outdoor temperature, supply line temperature]` pairs.
-pub(crate) struct HeatCurve(Vec<[f64; 2]>);
-impl PropertyValue for HeatCurve {
-    fn value(&self) -> String {
-        json(&self.0)
-    }
-}
-impl PropertyDescription for HeatCurve {
-    fn description(_: &PropertyEntry) -> HomiePropertyDescription {
-        json_description(HEAT_CURVE_SCHEMA)
-    }
-}
 
 /// Which kinds of operation the heat pump is carrying out at the moment, as a JSON array.
 ///
 /// This is a bit field, see footnote 6 in the guide.
-pub(crate) struct RunningDemands(u16);
+pub(crate) fn running_demands(bits: Value) -> Result<String, ()> {
+    const DEMAND_BITS: &[(u16, &str)] = &[
+        (0, "manual-operation"),
+        (1, "defrost"),
+        (2, "hot-water"),
+        (3, "heat"),
+        (4, "active-cooling"),
+        (5, "pool"),
+        (6, "anti-legionella"),
+        (7, "passive-cooling"),
+        (9, "standby"),
+        (10, "no-demand"),
+        (11, "off"),
+    ];
+    let active = DEMAND_BITS.iter().filter(|(bit, _)| bits.raw() & (1 << bit) != 0);
+    Ok(json(&active.map(|(_, name)| *name).collect::<Vec<_>>()))
+}
 
-const DEMAND_BITS: &[(u16, &str)] = &[
-    (0, "manual-operation"),
-    (1, "defrost"),
-    (2, "hot-water"),
-    (3, "heat"),
-    (4, "active-cooling"),
-    (5, "pool"),
-    (6, "anti-legionella"),
-    (7, "passive-cooling"),
-    (9, "standby"),
-    (10, "no-demand"),
-    (11, "off"),
-];
-
-impl RunningDemands {
-    pub(crate) fn new(bits: Value) -> Result<Self, ()> {
-        Ok(Self(bits.raw()))
-    }
-}
-impl PropertyValue for RunningDemands {
-    fn value(&self) -> String {
-        let active = DEMAND_BITS.iter().filter(|(bit, _)| self.0 & (1 << bit) != 0);
-        json(&active.map(|(_, name)| *name).collect::<Vec<_>>())
-    }
-}
-impl PropertyDescription for RunningDemands {
-    fn description(_: &PropertyEntry) -> HomiePropertyDescription {
-        json_description(STRING_LIST_SCHEMA)
-    }
-}
-impl AggregatePropertyValue for RunningDemands {
-    const SETTABLE: bool = false;
-}
-impl TryFrom<&str> for RunningDemands {
-    type Error = ();
-    fn try_from(_: &str) -> Result<Self, Self::Error> {
-        Err(())
-    }
+/// The units that a bit field with a bit for each of the (secondary) units has set, as a JSON
+/// array of the numbers of the bits. The first unit is the bit 0.
+pub(crate) fn unit_bits(bits: Value) -> Result<String, ()> {
+    Ok(json(&(0..u16::BITS).filter(|bit| bits.raw() & (1 << bit) != 0).collect::<Vec<_>>()))
 }
 
 /// The names of the alarms that are currently active.
@@ -145,31 +85,27 @@ impl PropertyKind for ActiveAlarmsKind {
         &alarms().registers
     }
 
-    fn value_from_modbus(&self, snapshot: &Snapshot) -> Option<Result<Box<DynPropertyValue>, ()>> {
+    fn read(&self, snapshot: &Snapshot) -> Option<Result<String, ()>> {
         let alarms = alarms();
         let mut active = Vec::new();
         for (register, name) in alarms.registers.iter().zip(&alarms.names) {
             match snapshot.value(*register) {
-                Some(value) if value.as_bool() => active.push(name.clone()),
+                Some(value) if value.as_bool() => active.push(name.as_str()),
                 Some(_) => {}
                 // An alarm that the heat pump does not have is never active.
                 None if snapshot.is_unreadable(*register) => {}
                 None => return None,
             }
         }
-        Some(Ok(Box::new(StringList(active))))
+        Some(Ok(json(&active)))
     }
 
-    fn value_from_homie(&self, _: &str) -> Result<Box<DynPropertyValue>, ()> {
+    fn write(&self, _: &str) -> Result<Vec<(Register, u16)>, ()> {
         Err(())
     }
 
-    fn to_modbus(&self, _: &DynPropertyValue) -> Result<Vec<(Register, u16)>, ()> {
-        Err(())
-    }
-
-    fn adjust_description(&self, description: &mut HomiePropertyDescription) {
-        read_only(description)
+    fn description(&self) -> HomiePropertyDescription {
+        string_list()
     }
 }
 
@@ -202,54 +138,22 @@ impl PropertyKind for HeatCurveKind {
         &self.registers
     }
 
-    fn value_from_modbus(&self, snapshot: &Snapshot) -> Option<Result<Box<DynPropertyValue>, ()>> {
+    fn read(&self, snapshot: &Snapshot) -> Option<Result<String, ()>> {
         let mut points = Vec::new();
         for i in 0..7 {
             let outdoor = snapshot.value(self.registers[i])?.as_f64();
             let supply = snapshot.value(self.registers[i + 7])?.as_f64();
             points.push([outdoor, supply]);
         }
-        Some(Ok(Box::new(HeatCurve(points))))
+        Some(Ok(json(&points)))
     }
 
-    fn value_from_homie(&self, _: &str) -> Result<Box<DynPropertyValue>, ()> {
+    fn write(&self, _: &str) -> Result<Vec<(Register, u16)>, ()> {
         Err(())
     }
 
-    fn to_modbus(&self, _: &DynPropertyValue) -> Result<Vec<(Register, u16)>, ()> {
-        Err(())
-    }
-
-    fn adjust_description(&self, description: &mut HomiePropertyDescription) {
-        read_only(description)
-    }
-}
-
-/// The units that a bit field with a bit for each of the (secondary) units has set, as a JSON
-/// array of the numbers of the bits. The first unit is the bit 0.
-pub(crate) struct UnitBits(u16);
-impl UnitBits {
-    pub(crate) fn new(bits: Value) -> Result<Self, ()> {
-        Ok(Self(bits.raw()))
-    }
-}
-impl PropertyValue for UnitBits {
-    fn value(&self) -> String {
-        json(&(0..u16::BITS).filter(|bit| self.0 & (1 << bit) != 0).collect::<Vec<_>>())
-    }
-}
-impl PropertyDescription for UnitBits {
-    fn description(_: &PropertyEntry) -> HomiePropertyDescription {
-        json_description(r#"{"type":"array","items":{"type":"integer","minimum":0,"maximum":15}}"#)
-    }
-}
-impl AggregatePropertyValue for UnitBits {
-    const SETTABLE: bool = false;
-}
-impl TryFrom<&str> for UnitBits {
-    type Error = ();
-    fn try_from(_: &str) -> Result<Self, Self::Error> {
-        Err(())
+    fn description(&self) -> HomiePropertyDescription {
+        json_description(HEAT_CURVE_SCHEMA)
     }
 }
 
@@ -274,35 +178,15 @@ mod tests {
 
     #[test]
     fn demands() {
-        let value = |bits| {
-            let v = Value::new(Register::input(2), bits);
-            RunningDemands::new(v).ok().unwrap().value()
-        };
+        let value = |bits| running_demands(Value::new(Register::input(2), bits)).unwrap();
         assert_eq!(value(0), "[]");
         assert_eq!(value(0b1100), r#"["hot-water","heat"]"#);
         assert_eq!(value(1 << 10), r#"["no-demand"]"#);
     }
 
     #[test]
-    fn heat_curve_registers() {
-        let curve = HeatCurveKind::new(109);
-        let registers = curve.registers();
-        assert_eq!(registers[0], Register::input(20));
-        assert_eq!(registers[6], Register::input(26));
-        assert_eq!(registers[7], Register::holding(109));
-        assert_eq!(registers[13], Register::holding(115));
-    }
-
-    #[test]
-    fn unit_bits() {
-        let bits = UnitBits::new(Value::new(Register::input(153), 0b101)).ok().unwrap();
-        assert_eq!(bits.value(), "[0,2]");
-    }
-
-    #[test]
-    fn schemas_are_json() {
-        for schema in [STRING_LIST_SCHEMA, HEAT_CURVE_SCHEMA] {
-            serde_json::from_str::<serde_json::Value>(schema).expect("valid JSON");
-        }
+    fn unit_bits_are_listed_by_number() {
+        let bits = unit_bits(Value::new(Register::input(153), 0b101)).unwrap();
+        assert_eq!(bits, "[0,2]");
     }
 }

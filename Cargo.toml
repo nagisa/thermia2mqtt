@@ -8,7 +8,7 @@ authors = ["Simonas Kazlauskas <thermia@kazlauskas.me>"]
 [dependencies]
 clap = { version = "4.6.7", features = ["cargo", "derive", "error-context"] }
 comfy-table = "8.0.1"
-csv-core = "0.1.13"
+csv = "1.4.0"
 futures = "0.3.34"
 homie5 = "0.12.0"
 humantime = "2.4.0"
@@ -18,8 +18,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 strum = { version = "0.28.0", features = ["derive"] }
 thiserror = "2.0.21"
-tokio = { version = "1.53.3", features = ["macros", "net", "rt", "sync", "time"] }
-tokio-modbus = { version = "0.17.0", default-features = false, features = ["tcp"] }
+tokio = { version = "1.53.3", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
 

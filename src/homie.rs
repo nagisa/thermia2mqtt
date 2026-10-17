@@ -193,8 +193,22 @@ struct SetCompleted {
 
 type SetFuture = Pin<Box<dyn Future<Output = SetCompleted> + Send>>;
 
-/// Which properties have a value at the moment, indexed like the properties of the nodes.
+/// Which properties are described, indexed like the properties of the nodes.
 type Availability = Vec<Vec<bool>>;
+
+/// Make everything that is available in `other` available in `available` too.
+///
+/// Returns whether there was anything to add.
+fn grow(available: &mut Availability, other: &Availability) -> bool {
+    let mut grown = false;
+    for (available, other) in available.iter_mut().zip(other) {
+        for (available, &other) in available.iter_mut().zip(other) {
+            grown |= other && !*available;
+            *available |= other;
+        }
+    }
+    grown
+}
 
 pub(crate) struct Device {
     args: Args,
@@ -205,10 +219,11 @@ pub(crate) struct Device {
     nodes: Vec<&'static Node>,
     /// The properties that are a part of the description.
     ///
-    /// A property is only there when its registers hold a usable value (e.g. a sensor that is
-    /// not installed does not have one.) There is no way to say that a property has no value,
-    /// and a device that is `ready` has to have values for all of its properties, so the ones
-    /// without values are not described at all.
+    /// A property is described if its registers held a usable value when the device was
+    /// described (e.g. a sensor that is not installed does not have one.) There is no way to say
+    /// that a property has no value, and a device that is `ready` has to have values for all of
+    /// its properties, so the ones without values are not described at all. Properties are never
+    /// removed from the description: when a value goes away the last one stays published.
     available: Availability,
     /// What we have last published, indexed like the properties of `nodes`.
     published: Vec<Vec<Option<String>>>,
@@ -242,7 +257,6 @@ fn build_description(
 }
 
 impl Device {
-    #[expect(clippy::result_large_err)]
     pub(crate) fn new(
         args: Args,
         mqtt: rumqttc::v5::AsyncClient,
@@ -251,13 +265,13 @@ impl Device {
         modbus: modbus::Handle,
         updates: mpsc::UnboundedReceiver<Update>,
         commands: mpsc::UnboundedReceiver<Command>,
-    ) -> Result<Self, Error> {
-        // What is really available is only known once the registers have been read.
+    ) -> Self {
+        // What is available is only known once the registers have been read.
         let available: Availability =
-            nodes.iter().map(|n| vec![true; n.properties.len()]).collect();
+            nodes.iter().map(|n| vec![false; n.properties.len()]).collect();
         let description = build_description(&args, &nodes, &available);
         let published = nodes.iter().map(|n| vec![None; n.properties.len()]).collect();
-        Ok(Self {
+        Self {
             args,
             mqtt,
             state: HomieDeviceStatus::Init,
@@ -270,14 +284,13 @@ impl Device {
             updates,
             commands,
             sets: FuturesUnordered::new(),
-        })
+        }
     }
 
     /// Which properties we can make a value for out of what the registers hold at the moment.
     fn compute_availability(&self) -> Availability {
         let snapshot = self.modbus.snapshot();
-        let available = |property: &PropertyEntry| match property.kind.value_from_modbus(&snapshot)
-        {
+        let available = |property: &PropertyEntry| match property.kind.read(&snapshot) {
             Some(Ok(_)) => true,
             Some(Err(())) => false,
             // Actions do not have a value, but are there. For the others we are missing registers.
@@ -296,7 +309,8 @@ impl Device {
         self.mqtt.homie_publish(p).await.map_err(error)
     }
 
-    /// Wait until there is a value for every register we need.
+    /// Wait until every register we need has been read, or is known to be missing from the heat
+    /// pump.
     async fn wait_for_registers(&mut self) -> Result<(), Error> {
         tracing::info!("waiting for device read out…");
         let needed: BTreeSet<Register> = self
@@ -321,17 +335,6 @@ impl Device {
     ///
     /// Must be done while the device is not `ready`.
     async fn publish_properties(&mut self) -> Result<(), Error> {
-        let available = self.compute_availability();
-        for (node, available) in self.nodes.iter().zip(&available) {
-            for (property, _) in node.properties.iter().zip(available).filter(|(_, a)| !**a) {
-                tracing::info!(
-                    node_id = %node.id,
-                    prop_id = %property.prop_id,
-                    "the heat pump has no value for the property, it is not described"
-                );
-            }
-        }
-        self.available = available;
         self.description = build_description(&self.args, &self.nodes, &self.available);
         let p = self
             .protocol
@@ -341,26 +344,18 @@ impl Device {
 
         for node_idx in 0..self.nodes.len() {
             for prop_idx in 0..self.nodes[node_idx].properties.len() {
-                self.published[node_idx][prop_idx] = None;
                 if self.available[node_idx][prop_idx] {
                     self.refresh(node_idx, prop_idx, true).await?;
                 } else {
-                    // Nothing may be left from before the property went away (or from a run that
-                    // had a value for it.)
+                    // Nothing may be left from a run that had a value for the property.
                     self.erase_value(node_idx, prop_idx).await?;
                 }
             }
         }
-        // rumqttc appears to be sending publishes in a weird order that results in some of the
-        // properties getting published *after* `$state = Ready`. Yielding here gives it *some*
-        // time to do it's thing.
-        tokio::task::yield_now().await;
         Ok(())
     }
 
     async fn subscribe(&mut self) -> Result<(), Error> {
-        // SUBTLE: rumqttc balks at empty list of subscriptions, but that can happen if we don't
-        // really have any settable properties...
         if !self.args.allow_writes {
             return Ok(());
         }
@@ -369,6 +364,8 @@ impl Device {
             .subscribe_props(&self.description)
             .map_err(Error::ConstructTopicSubscriptions)?
             .peekable();
+        // SUBTLE: rumqttc balks at empty list of subscriptions, but that can happen if we don't
+        // really have any settable properties...
         if p.peek().is_some() {
             self.mqtt.homie_subscribe(p).await.map_err(Error::Subscribe)?;
         }
@@ -379,6 +376,16 @@ impl Device {
         self.publish_state(HomieDeviceStatus::Init).await?;
         // The description depends on what the heat pump has to say.
         self.wait_for_registers().await?;
+        self.available = self.compute_availability();
+        for (node, available) in self.nodes.iter().zip(&self.available) {
+            for (property, _) in node.properties.iter().zip(available).filter(|(_, a)| !**a) {
+                tracing::info!(
+                    node_id = %node.id,
+                    prop_id = %property.prop_id,
+                    "the heat pump has no value for the property, it is not described"
+                );
+            }
+        }
         self.publish_properties().await?;
         self.subscribe().await?;
         self.publish_state(HomieDeviceStatus::Ready).await?;
@@ -386,11 +393,11 @@ impl Device {
         Ok(())
     }
 
-    /// Describe the properties again, as some have gained or lost their values.
+    /// Describe the properties again, as some have gained their values.
     ///
     /// The description may only change while the device is not `ready`.
     async fn reconfigure(&mut self) -> Result<(), Error> {
-        tracing::info!("the properties that have values have changed, describing the device again");
+        tracing::info!("more properties have values now, describing the device again");
         self.publish_state(HomieDeviceStatus::Init).await?;
         self.publish_properties().await?;
         self.subscribe().await?;
@@ -412,12 +419,11 @@ impl Device {
         }
         let value = {
             let snapshot = self.modbus.snapshot();
-            property.kind.value_from_modbus(&snapshot)
+            property.kind.read(&snapshot)
         };
         let value = match value {
-            Some(Ok(value)) => value.value(),
-            // An action, or something that is going to be dealt with by describing the device
-            // again.
+            Some(Ok(value)) => value,
+            // An action, or a value that is not usable right now (the last one stays.)
             None | Some(Err(())) => return Ok(()),
         };
         if !force && self.published[node_idx][prop_idx].as_deref() == Some(value.as_str()) {
@@ -466,8 +472,9 @@ impl Device {
     }
 
     async fn handle_update(&mut self, update: Update) -> Result<(), Error> {
-        // A sensor can come and go. That is a change to what is described, not to a value.
-        if self.compute_availability() != self.available {
+        // Registers that could not be read earlier may have been read since.
+        let current = self.compute_availability();
+        if grow(&mut self.available, &current) {
             return self.reconfigure().await;
         }
         let changed: HashSet<Register> = update.changed.into_iter().collect();
@@ -514,17 +521,13 @@ impl Device {
             return Ok(());
         }
 
-        let writes = entry
-            .kind
-            .value_from_homie(&value)
-            .and_then(|parsed| Ok((entry.kind.to_modbus(&*parsed)?, parsed.value())));
-        let Ok((writes, parsed)) = writes else {
+        let Ok(writes) = entry.kind.write(&value) else {
             tracing::warn!(%node_id, %prop_id, value, "property/set could not be understood");
             // The controller is told what the actual value is.
             return self.refresh(node_idx, prop_idx, true).await;
         };
         let modbus = self.modbus.clone();
-        let acknowledgement = entry.kind.registers().is_empty().then_some(parsed);
+        let acknowledgement = entry.kind.registers().is_empty().then_some(value);
         self.sets.push(Box::pin(async move {
             let result = modbus.write(writes).await;
             SetCompleted { node_idx, prop_idx, result, acknowledgement }
@@ -643,6 +646,7 @@ mod tests {
     use crate::modbus::Snapshot;
     use crate::registers::Space;
     use clap::Parser as _;
+    use homie5::device_description::HomiePropertyFormat;
 
     fn default_args() -> Args {
         Args::parse_from(["test"])
@@ -665,11 +669,52 @@ mod tests {
         node.properties.iter().find(|p| p.prop_id.to_string() == prop_id).expect("prop exists")
     }
 
-    /// The published value of the property, as a string.
+    /// The published value of the property, as computed from the snapshot.
     fn value_of(node_id: &str, prop_id: &str, snapshot: &Snapshot) -> Option<String> {
-        let property = property(node_id, prop_id);
-        let value = property.kind.value_from_modbus(snapshot)?;
-        Some(value.ok().expect("value could be computed").value())
+        let value = property(node_id, prop_id).kind.read(snapshot)?;
+        Some(value.expect("value could be computed"))
+    }
+
+    fn is_described(description: &HomieDeviceDescription, node_id: &str, prop_id: &str) -> bool {
+        let (node, prop) =
+            (node_id.parse::<HomieID>().unwrap(), prop_id.parse::<HomieID>().unwrap());
+        description.get_property_by_id(&node, &prop).is_some()
+    }
+
+    /// A device that is not connected to anything, with the registers as the snapshot has them.
+    ///
+    /// Publishing queues the messages in the client, which is never polled, so they are dropped
+    /// along with the returned event loop.
+    fn test_device(args: Args, snapshot: Snapshot) -> (Device, rumqttc::v5::EventLoop) {
+        let nodes = select_nodes(&args).unwrap();
+        let (client, events) = rumqttc::v5::AsyncClient::new(
+            rumqttc::v5::MqttOptions::new("test", "127.0.0.1", 1883),
+            10_000,
+        );
+        let (protocol, _) = Homie5DeviceProtocol::new(
+            "thermia".to_string().try_into().unwrap(),
+            homie5::HomieDomain::Default,
+        );
+        let (_, updates) = mpsc::unbounded_channel();
+        let (_, commands) = mpsc::unbounded_channel();
+        let handle = modbus::Handle::detached(snapshot);
+        (Device::new(args, client, protocol, nodes, handle, updates, commands), events)
+    }
+
+    /// Every register the nodes need is 1, apart from what is overridden.
+    fn all_registers(args: &Args, overrides: &[(Space, u16, u16)]) -> Vec<(Space, u16, u16)> {
+        let mut words: BTreeMap<(Space, u16), u16> = BTreeMap::new();
+        for node in select_nodes(args).unwrap() {
+            for property in node.properties {
+                for register in property.kind.registers() {
+                    words.insert((register.space(), register.address()), 1);
+                }
+            }
+        }
+        for &(space, address, word) in overrides {
+            words.insert((space, address), word);
+        }
+        words.into_iter().map(|((space, address), word)| (space, address, word)).collect()
     }
 
     #[test]
@@ -682,7 +727,7 @@ mod tests {
             for property in node.properties {
                 let name = format!("{}/{}", node.id, property.prop_id);
                 assert!(prop_ids.insert(property.prop_id.clone()), "{name} is duplicated");
-                let description = property.description();
+                let description = property.kind.description();
                 let registers = property.kind.registers();
                 if description.settable {
                     // Either there's registers that can be written to, or this is an action.
@@ -706,30 +751,20 @@ mod tests {
         let args = Args::parse_from(["test", "--nodes", &all]);
         assert!(!args.allow_writes);
         let nodes = select_nodes(&args).unwrap();
-        let (client, _) = rumqttc::v5::AsyncClient::new(
-            rumqttc::v5::MqttOptions::new("test", "127.0.0.1", 1883),
-            10,
-        );
+        let available: Availability =
+            nodes.iter().map(|n| vec![true; n.properties.len()]).collect();
+        let description = build_description(&args, &nodes, &available);
         let (protocol, _) = Homie5DeviceProtocol::new(
             "thermia".to_string().try_into().unwrap(),
             homie5::HomieDomain::Default,
         );
-        let validation_protocol = Homie5DeviceProtocol::new(
-            "thermia".to_string().try_into().unwrap(),
-            homie5::HomieDomain::Default,
-        )
-        .0;
-        let (_, updates) = mpsc::unbounded_channel();
-        let (_, commands) = mpsc::unbounded_channel();
-        let handle = modbus::Handle::detached(Snapshot::new());
-        let device = Device::new(args, client, protocol, nodes, handle, updates, commands).unwrap();
-        for node in device.description.nodes.values() {
+        for node in description.nodes.values() {
             for (id, property) in &node.properties {
                 assert!(!property.settable, "{id} is settable");
             }
         }
         // The description is acceptable to the protocol implementation.
-        validation_protocol.publish_description(&device.description).expect("valid description");
+        protocol.publish_description(&description).expect("valid description");
     }
 
     #[test]
@@ -779,7 +814,7 @@ mod tests {
             ("system", "outdoor-temperature-override"),
         ] {
             let kind = property(node_id, prop_id).kind;
-            assert!(kind.value_from_modbus(&snapshot).unwrap().is_err(), "{node_id}/{prop_id}");
+            assert!(kind.read(&snapshot).unwrap().is_err(), "{node_id}/{prop_id}");
         }
         // Just below the sentinel is a valid temperature.
         assert_eq!(value_of("system", "outdoor-temperature", &snapshot).unwrap(), "199.99");
@@ -793,10 +828,30 @@ mod tests {
     }
 
     #[test]
-    fn unknown_enum_values_are_not_published() {
-        let snapshot = snapshot(&[(Space::Holding, 0, 42)]);
+    fn unknown_enum_values_are_published_as_unknown() {
+        let snapshot = snapshot(&[
+            (Space::Holding, 0, 42),
+            (Space::Input, 1, 42),
+            (Space::Input, 55, 4),
+            (Space::Input, 56, 99),
+        ]);
+        assert_eq!(value_of("system", "mode", &snapshot).unwrap(), "unknown");
+        assert_eq!(value_of("system", "running-demand", &snapshot).unwrap(), "unknown");
+        assert_eq!(
+            value_of("system", "running-demands-by-priority", &snapshot).unwrap(),
+            r#"["unknown","heat"]"#
+        );
+        // The controllers are told which values there are.
+        let description = property("system", "mode").kind.description();
+        let values = ["off", "standby", "on", "unknown"].map(String::from).to_vec();
+        assert_eq!(description.format, HomiePropertyFormat::Enum(values));
+    }
+
+    #[test]
+    fn unknown_cannot_be_set() {
         let mode = property("system", "mode");
-        assert!(mode.kind.value_from_modbus(&snapshot).unwrap().is_err());
+        assert_eq!(mode.kind.write("on"), Ok(vec![(Register::holding(0), 3)]));
+        assert!(mode.kind.write("unknown").is_err());
     }
 
     #[test]
@@ -837,18 +892,13 @@ mod tests {
     fn what_to_write() {
         // Only for the sake of checking the mapping, nothing is written anywhere.
         let start = property("tap-water", "start-temperature");
-        let parsed = start.kind.value_from_homie("45.5").ok().unwrap();
-        let writes = start.kind.to_modbus(&*parsed).ok().unwrap();
-        assert_eq!(writes.len(), 1);
-        assert_eq!(writes[0].0, Register::holding(22));
-        assert_eq!(writes[0].1, 4550);
+        assert_eq!(start.kind.write("45.5"), Ok(vec![(Register::holding(22), 4550)]));
         // Out of what the register can represent.
-        let parsed = start.kind.value_from_homie("1000").ok().unwrap();
-        assert!(start.kind.to_modbus(&*parsed).is_err());
-        assert!(start.kind.value_from_homie("warm").is_err());
-        // Read-only values cannot be set.
+        assert!(start.kind.write("1000").is_err());
+        assert!(start.kind.write("warm").is_err());
+        // Read-only values are not settable.
         let top = property("tap-water", "top-temperature");
-        assert!(!top.description().settable);
+        assert!(!top.kind.description().settable);
     }
 
     #[test]
@@ -879,90 +929,62 @@ mod tests {
         assert!(poll_groups(&select_nodes(&args).unwrap(), &args).is_err());
     }
 
-    /// A device that is not connected to anything, with the specified registers set.
-    fn test_device(args: Args, words: &[(Space, u16, u16)]) -> Device {
-        test_device_from(args, snapshot(words))
-    }
-
-    fn test_device_from(args: Args, snapshot: Snapshot) -> Device {
-        let nodes = select_nodes(&args).unwrap();
-        let (client, _) = rumqttc::v5::AsyncClient::new(
-            rumqttc::v5::MqttOptions::new("test", "127.0.0.1", 1883),
-            10,
-        );
-        let (protocol, _) = Homie5DeviceProtocol::new(
-            "thermia".to_string().try_into().unwrap(),
-            homie5::HomieDomain::Default,
-        );
-        let (_, updates) = mpsc::unbounded_channel();
-        let (_, commands) = mpsc::unbounded_channel();
-        let handle = modbus::Handle::detached(snapshot);
-        Device::new(args, client, protocol, nodes, handle, updates, commands).unwrap()
-    }
-
-    /// Every register the nodes need is 1, apart from what is overridden.
-    fn all_registers(args: &Args, overrides: &[(Space, u16, u16)]) -> Vec<(Space, u16, u16)> {
-        let mut words: BTreeMap<(Space, u16), u16> = BTreeMap::new();
-        for node in select_nodes(args).unwrap() {
-            for property in node.properties {
-                for register in property.kind.registers() {
-                    words.insert((register.space(), register.address()), 1);
-                }
-            }
-        }
-        for &(space, address, word) in overrides {
-            words.insert((space, address), word);
-        }
-        words.into_iter().map(|((space, address), word)| (space, address, word)).collect()
-    }
-
-    #[test]
-    fn properties_without_values_are_not_described() {
+    #[tokio::test]
+    async fn properties_without_values_are_not_described() {
         let args = default_args();
         let sensors_missing =
             [(Space::Input, 27, 20000), (Space::Input, 121, 2000), (Space::Holding, 118, 20000)];
-        let missing = test_device(args.clone(), &all_registers(&args, &sensors_missing));
-        let present = test_device(args.clone(), &all_registers(&args, &[]));
+        let words = all_registers(&args, &sensors_missing);
+        let (mut missing, _events) = test_device(args.clone(), snapshot(&words));
+        missing.publish_device().await.unwrap();
+        let words = all_registers(&args, &[]);
+        let (mut present, _events) = test_device(args.clone(), snapshot(&words));
+        present.publish_device().await.unwrap();
 
-        let available = missing.compute_availability();
-        let described = |device: &Device, node: &str, prop: &str| {
-            let (node, prop) = (node.parse::<HomieID>().unwrap(), prop.parse::<HomieID>().unwrap());
-            device.description.get_property_by_id(&node, &prop).is_some()
-        };
-        let description = build_description(&args, &missing.nodes, &available);
-        let described_in = |node: &str, prop: &str| {
-            let (node, prop) = (node.parse::<HomieID>().unwrap(), prop.parse::<HomieID>().unwrap());
-            description.get_property_by_id(&node, &prop).is_some()
-        };
         for (node, prop) in [
             ("system", "room-temperature"),
             ("system", "outdoor-temperature-override"),
             ("heating", "return-temperature"),
         ] {
-            assert!(!described_in(node, prop), "{node}/{prop} should not be described");
-            assert!(described(&present, node, prop), "{node}/{prop} should be described");
+            assert!(!is_described(&missing.description, node, prop), "{node}/{prop}");
+            assert!(is_described(&present.description, node, prop), "{node}/{prop}");
         }
-        assert!(described_in("system", "outdoor-temperature"));
+        assert!(is_described(&missing.description, "system", "outdoor-temperature"));
         // Actions do not have values, but are still there.
-        assert!(described_in("alarms", "reset"));
-        // This is what makes the device describe itself again, when a sensor shows up.
-        assert_ne!(available, present.compute_availability());
-        assert_eq!(present.compute_availability(), present.available);
+        assert!(is_described(&missing.description, "alarms", "reset"));
     }
-    #[test]
-    fn coefficient_of_performance() {
-        // 12.5 kW of heat out of 3 kW of electricity.
-        let running = snapshot(&[(Space::Input, 157, 1250), (Space::Input, 158, 300)]);
-        assert_eq!(value_of("power", "output", &running).unwrap(), "12.5");
-        assert_eq!(value_of("power", "consumption", &running).unwrap(), "3");
-        assert_eq!(value_of("power", "cop", &running).unwrap(), "4.17");
-        // Nothing consumed, nothing to divide by. This must stay a value: a property that comes
-        // and goes changes what the device is described as.
-        let idle = snapshot(&[(Space::Input, 157, 0), (Space::Input, 158, 0)]);
-        assert_eq!(value_of("power", "cop", &idle).unwrap(), "0");
+
+    #[tokio::test]
+    async fn a_sensor_that_stops_reporting_stays_described() {
+        let args = default_args();
+        let words = all_registers(&args, &[]);
+        let (mut device, _events) = test_device(args, snapshot(&words));
+        device.publish_device().await.unwrap();
+        assert_eq!(device.state, HomieDeviceStatus::Ready);
+
+        // The heat pump now reports "not connected" for the room sensor, which is 200.0 °C.
+        device.modbus.snapshot_mut().set(Space::Input, 121, 2000);
+        device.handle_update(Update { changed: vec![Register::input(121)] }).await.unwrap();
+        assert_eq!(device.state, HomieDeviceStatus::Ready);
+        assert!(is_described(&device.description, "system", "room-temperature"));
     }
-    #[test]
-    fn registers_that_the_heat_pump_does_not_have() {
+
+    #[tokio::test]
+    async fn a_sensor_that_starts_reporting_is_described() {
+        let args = default_args();
+        let words = all_registers(&args, &[(Space::Input, 121, 2000)]);
+        let (mut device, _events) = test_device(args, snapshot(&words));
+        device.publish_device().await.unwrap();
+        assert!(!is_described(&device.description, "system", "room-temperature"));
+
+        device.modbus.snapshot_mut().set(Space::Input, 121, 215);
+        device.handle_update(Update { changed: vec![Register::input(121)] }).await.unwrap();
+        assert_eq!(device.state, HomieDeviceStatus::Ready);
+        assert!(is_described(&device.description, "system", "room-temperature"));
+    }
+
+    #[tokio::test]
+    async fn registers_that_the_heat_pump_does_not_have() {
         let args = Args::parse_from(["test", "--nodes", "alarms,power,power-limit"]);
         // No alarms are active.
         let quiet: Vec<_> = property("alarms", "active")
@@ -985,18 +1007,27 @@ mod tests {
         // An alarm that is not there is not active, and does not make the rest unknowable.
         assert_eq!(value_of("alarms", "active", &snapshot).unwrap(), "[]");
 
-        let device = test_device_from(args.clone(), snapshot);
-        let available = device.compute_availability();
-        let description = build_description(&args, &device.nodes, &available);
-        let described = |node: &str, prop: &str| {
-            let (node, prop) = (node.parse::<HomieID>().unwrap(), prop.parse::<HomieID>().unwrap());
-            description.get_property_by_id(&node, &prop).is_some()
-        };
-        assert!(described("alarms", "active"));
-        assert!(described("power", "output"));
-        assert!(!described("power-limit", "limit"));
-        assert!(!described("power-limit", "control-mode"));
+        let (mut device, _events) = test_device(args, snapshot);
+        device.publish_device().await.unwrap();
+        assert!(is_described(&device.description, "alarms", "active"));
+        assert!(is_described(&device.description, "power", "output"));
+        assert!(!is_described(&device.description, "power-limit", "limit"));
+        assert!(!is_described(&device.description, "power-limit", "control-mode"));
     }
+
+    #[test]
+    fn coefficient_of_performance() {
+        // 12.5 kW of heat out of 3 kW of electricity.
+        let running = snapshot(&[(Space::Input, 157, 1250), (Space::Input, 158, 300)]);
+        assert_eq!(value_of("power", "output", &running).unwrap(), "12.5");
+        assert_eq!(value_of("power", "consumption", &running).unwrap(), "3");
+        assert_eq!(value_of("power", "cop", &running).unwrap(), "4.17");
+        // Nothing consumed, nothing to divide by. It must still have a value: a property is only
+        // described if it has one at startup, so an absent COP would drop it from the description.
+        let idle = snapshot(&[(Space::Input, 157, 0), (Space::Input, 158, 0)]);
+        assert_eq!(value_of("power", "cop", &idle).unwrap(), "0");
+    }
+
     #[test]
     fn statistics_match_the_display() {
         // What the registers held when the display showed these (the day and year, heat and tap

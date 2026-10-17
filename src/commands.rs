@@ -13,16 +13,6 @@ pub mod registers {
         output: crate::output::Args,
     }
 
-    #[derive(thiserror::Error, Debug)]
-    pub enum Error {
-        #[error(transparent)]
-        CreateOutput(crate::output::Error),
-        #[error(transparent)]
-        WriteOutput(crate::output::Error),
-        #[error(transparent)]
-        CommitOutput(crate::output::Error),
-    }
-
     #[derive(serde::Serialize)]
     struct RegisterSchema {
         space: Space,
@@ -34,6 +24,33 @@ pub mod registers {
         description: &'static str,
     }
 
+    impl RegisterSchema {
+        fn new(register: Register) -> Self {
+            let def = register.def();
+            RegisterSchema {
+                space: def.space,
+                address: def.address,
+                de_facto_address: def.de_facto_address(),
+                scale: def.scale,
+                signed: def.signed,
+                unit: def.unit,
+                description: def.description,
+            }
+        }
+
+        fn table_row(&self) -> Vec<String> {
+            vec![
+                self.space.to_string(),
+                self.address.to_string(),
+                self.de_facto_address.to_string(),
+                self.scale.to_string(),
+                self.signed.to_string(),
+                self.unit.to_string(),
+                self.description.to_string(),
+            ]
+        }
+    }
+
     fn is_match(register: Register, pattern: &str) -> bool {
         let def = register.def();
         let pattern = pattern.to_lowercase();
@@ -43,20 +60,18 @@ pub mod registers {
             || def.de_facto_address().to_string() == pattern
     }
 
-    pub fn run(args: Args) -> Result<(), Error> {
-        let mut output = args.output.to_output().map_err(Error::CreateOutput)?;
+    pub fn run(args: Args) -> Result<(), crate::output::Error> {
+        let mut output = args.output.to_output()?;
         let exposed = crate::homie::exposed_registers();
-        output
-            .table_headers(vec![
-                "Space",
-                "Address",
-                "De facto",
-                "Scale",
-                "Signed",
-                "Unit",
-                "Description",
-            ])
-            .map_err(Error::WriteOutput)?;
+        output.table_headers(vec![
+            "Space",
+            "Address",
+            "De facto",
+            "Scale",
+            "Signed",
+            "Unit",
+            "Description",
+        ])?;
         for register in Register::all() {
             if args.filter.as_deref().is_some_and(|pattern| !is_match(register, pattern)) {
                 continue;
@@ -64,34 +79,10 @@ pub mod registers {
             if args.unmapped && exposed.contains(&register) {
                 continue;
             }
-            let def = register.def();
-            let record = RegisterSchema {
-                space: def.space,
-                address: def.address,
-                de_facto_address: def.de_facto_address(),
-                scale: def.scale,
-                signed: def.signed,
-                unit: def.unit,
-                description: def.description,
-            };
-            output
-                .result(
-                    || {
-                        vec![
-                            def.space.to_string(),
-                            def.address.to_string(),
-                            def.de_facto_address().to_string(),
-                            def.scale.to_string(),
-                            def.signed.to_string(),
-                            def.unit.to_string(),
-                            def.description.to_string(),
-                        ]
-                    },
-                    || &record,
-                )
-                .map_err(Error::WriteOutput)?;
+            let record = RegisterSchema::new(register);
+            output.result(|| record.table_row(), || &record)?;
         }
-        output.commit().map_err(Error::CommitOutput)
+        output.commit()
     }
 }
 
@@ -205,8 +196,7 @@ pub mod mqtt {
             handle,
             updates,
             command_rx,
-        )
-        .map_err(Error::CreateDevice)?;
+        );
         {
             let mut publish_future = std::pin::pin!(device.publish_device());
             loop {

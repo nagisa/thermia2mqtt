@@ -40,6 +40,16 @@ impl Snapshot {
         self.unreadable[space.index()].insert(address)
     }
 
+    /// Stop considering any of the addresses unreadable, returning what they were.
+    pub(crate) fn forget_unreadable(&mut self) -> Vec<(Space, u16)> {
+        let mut forgotten = Vec::new();
+        for space in Space::ALL {
+            let addresses = std::mem::take(&mut self.unreadable[space.index()]);
+            forgotten.extend(addresses.into_iter().map(|address| (space, address)));
+        }
+        forgotten
+    }
+
     /// The heat pump has no register at this address, and there is no point in asking for it.
     pub fn is_unreadable(&self, register: Register) -> bool {
         self.unreadable[register.space().index()].contains(&register.address())
@@ -48,11 +58,6 @@ impl Snapshot {
     /// All of the addresses known to be unreadable in the space.
     pub(crate) fn unreadable_addresses(&self, space: Space) -> &BTreeSet<u16> {
         &self.unreadable[space.index()]
-    }
-
-    /// The registers out of those specified that have not been read yet.
-    pub fn missing(&self, registers: impl IntoIterator<Item = Register>) -> Vec<Register> {
-        registers.into_iter().filter(|&r| !self.contains(r)).collect()
     }
 
     /// The registers that we do not know the fate of yet: neither read, nor found to be unreadable.
@@ -74,7 +79,6 @@ mod tests {
         assert!(snapshot.set(Space::Holding, 22, 3));
         assert_eq!(snapshot.raw(Space::Input, 22), Some(1));
         assert_eq!(snapshot.value(Register::holding(22)).map(|v| v.raw()), Some(3));
-        assert_eq!(snapshot.missing([Register::holding(22), Register::holding(23)]).len(), 1);
     }
 
     #[test]
@@ -87,8 +91,13 @@ mod tests {
         assert!(!snapshot.set_unreadable(Space::Holding, 23));
         // Unreadable in one space does not say anything about the others.
         assert_eq!(snapshot.unresolved(registers), vec![Register::input(22)]);
-        assert_eq!(snapshot.missing(registers).len(), 2);
         assert!(snapshot.is_unreadable(Register::holding(23)));
         assert!(!snapshot.is_unreadable(Register::input(22)));
+
+        let mut forgotten = snapshot.forget_unreadable();
+        forgotten.sort();
+        assert_eq!(forgotten, vec![(Space::Holding, 23)]);
+        assert!(!snapshot.is_unreadable(Register::holding(23)));
+        assert_eq!(snapshot.unresolved(registers).len(), 2);
     }
 }

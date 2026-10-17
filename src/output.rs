@@ -1,7 +1,5 @@
 use std::path::PathBuf;
 
-use csv_core::WriteResult;
-
 #[derive(clap::ValueEnum, Clone, Debug)]
 pub enum Format {
     Table,
@@ -88,29 +86,12 @@ impl Output {
         Ok(())
     }
 
-    fn write_csv_row<V: std::ops::Deref<Target = str>>(
-        &mut self,
-        values: &[V],
-    ) -> Result<(), Error> {
-        let max_len = 2 + 2 * values.iter().map(|v| v.len()).max().unwrap_or(0);
-        let mut output = vec![0; max_len];
-        let mut writer = csv_core::Writer::new();
-        for value in values {
-            let inp = value.as_bytes();
-            let (WriteResult::InputEmpty, ib, ob) = writer.field(inp, &mut output) else {
-                panic!("something wrong with csv output");
-            };
-            assert_eq!(value.len(), ib);
-            self.io.write_all(&output[..ob]).map_err(|e| self.write_error(e))?;
-            let (WriteResult::InputEmpty, ob) = writer.delimiter(&mut output) else {
-                panic!("something wrong with csv output");
-            };
-            self.io.write_all(&output[..ob]).map_err(|e| self.write_error(e))?;
-        }
-        let (WriteResult::InputEmpty, ob) = writer.terminator(&mut output) else {
-            panic!("something wrong with csv output");
+    fn write_csv_row<V: AsRef<[u8]>>(&mut self, values: &[V]) -> Result<(), Error> {
+        let result = {
+            let mut writer = csv::Writer::from_writer(&mut self.io);
+            writer.write_record(values).and_then(|()| writer.flush().map_err(csv::Error::from))
         };
-        self.io.write_all(&output[..ob]).map_err(|e| self.write_error(e))
+        result.map_err(|e| self.write_error(e.into()))
     }
 
     pub fn result<R: serde::Serialize>(

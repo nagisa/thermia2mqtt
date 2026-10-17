@@ -8,22 +8,16 @@
 //! "EM" in the descriptions of the registers is for the expansion module) are not enabled unless
 //! asked for.
 
-use crate::homie::custom::{
-    ActiveAlarmsKind, HeatCurve, HeatCurveKind, RunningDemands, STRING_LIST_SCHEMA, StringList,
-    UnitBits, json, json_description,
-};
+use crate::homie::custom::{ActiveAlarmsKind, HeatCurveKind, running_demands, unit_bits};
 use crate::homie::node::{Node, PropertyEntry, properties};
 use crate::homie::value::{
-    ActionPropertyValue, AggregatePropertyValue, BooleanValue, CoefficientOfPerformance,
-    EnergyValue, FloatValue, IntegerValue, MinutesValue, OperatingTime, PropertyDescription,
-    PropertyValue, SecondsValue, SplitEnergy, VersionValue, homie_enum, string_enum, unit,
+    BooleanValue, FloatValue, IntegerValue, MinutesValue, SecondsValue, coefficient_of_performance,
+    json, meter_energy, operating_time, split_energy, string_enum, unit, version,
 };
 use crate::registers::{Register, Value};
 use homie5::HomieID;
-use homie5::device_description::HomiePropertyDescription;
 
 string_enum! {
-    #[impl(TryFromValue, PropertyValue, RegisterPropertyValue, PropertyDescription)]
     #[repr(u16)]
     #[derive(Clone, Copy)]
     enum OperationalMode {
@@ -34,7 +28,6 @@ string_enum! {
 }
 
 string_enum! {
-    #[impl(TryFromValue, PropertyValue, RegisterPropertyValue, PropertyDescription)]
     #[repr(u16)]
     #[derive(Clone, Copy)]
     enum Demand {
@@ -53,7 +46,6 @@ string_enum! {
 }
 
 string_enum! {
-    #[impl(TryFromValue, PropertyValue, RegisterPropertyValue, PropertyDescription)]
     #[repr(u16)]
     #[derive(Clone, Copy)]
     enum SmartGridMode {
@@ -65,7 +57,6 @@ string_enum! {
 }
 
 string_enum! {
-    #[impl(TryFromValue, PropertyValue, RegisterPropertyValue, PropertyDescription)]
     #[repr(u16)]
     #[derive(Clone, Copy)]
     enum OutdoorTemperatureSource {
@@ -75,7 +66,6 @@ string_enum! {
 }
 
 string_enum! {
-    #[impl(TryFromValue, PropertyValue, RegisterPropertyValue, PropertyDescription)]
     #[repr(u16)]
     #[derive(Clone, Copy)]
     enum MixValveMode {
@@ -86,7 +76,6 @@ string_enum! {
 }
 
 string_enum! {
-    #[impl(TryFromValue, PropertyValue, RegisterPropertyValue, PropertyDescription)]
     #[repr(u16)]
     #[derive(Clone, Copy)]
     enum ImmersionHeater {
@@ -95,108 +84,47 @@ string_enum! {
     }
 }
 
-/// An action that can only be told to happen "now".
-macro_rules! now_action {
-    ($name:ident, $($writes:expr),+) => {
-        #[derive(Clone, Copy)]
-        struct $name;
-        impl PropertyValue for $name {
-            fn value(&self) -> String {
-                "now".to_string()
-            }
-        }
-        impl PropertyDescription for $name {
-            fn description(_: &PropertyEntry) -> HomiePropertyDescription {
-                homie_enum::<Self>()
-            }
-        }
-        impl strum::VariantNames for $name {
-            const VARIANTS: &'static [&'static str] = &["now"];
-        }
-        impl TryFrom<&str> for $name {
-            type Error = ();
-            fn try_from(value: &str) -> Result<Self, Self::Error> {
-                (value == "now").then_some($name).ok_or(())
-            }
-        }
-        impl ActionPropertyValue for $name {
-            fn writes(&self) -> Vec<(Register, u16)> {
-                vec![$($writes),+]
-            }
-        }
-    };
-}
-
-now_action!(ResetAlarms, (Register::coil(3), 1));
-
 /// The names of the demands, without those that say there is nothing to do.
-fn demand_names(values: &[Value]) -> Result<Vec<&'static str>, ()> {
-    let mut names = Vec::new();
-    for &value in values {
-        let demand = Demand::try_from(value)?;
-        if !matches!(demand, Demand::NoDemand) {
-            names.push(<&'static str>::from(&demand));
-        }
-    }
-    Ok(names)
+fn demand_names(values: &[Value]) -> Vec<&'static str> {
+    let demands = values.iter().map(|&value| Demand::from(value));
+    demands.filter(|demand| !matches!(demand, Demand::NoDemand)).map(|d| (&d).into()).collect()
 }
 
-/// A list of demands out of a number of registers, as a JSON array of their names.
-macro_rules! demand_list {
-    ($name:ident($($arg:ident),+)) => {
-        struct $name(Vec<&'static str>);
-        impl $name {
-            fn new($($arg: Value),+) -> Result<Self, ()> {
-                Ok(Self(demand_names(&[$($arg),+])?))
-            }
-        }
-        impl PropertyValue for $name {
-            fn value(&self) -> String {
-                json(&self.0)
-            }
-        }
-        impl PropertyDescription for $name {
-            fn description(_: &PropertyEntry) -> HomiePropertyDescription {
-                json_description(STRING_LIST_SCHEMA)
-            }
-        }
-        impl AggregatePropertyValue for $name {
-            const SETTABLE: bool = false;
-        }
-        impl TryFrom<&str> for $name {
-            type Error = ();
-            fn try_from(_: &str) -> Result<Self, Self::Error> {
-                Err(())
-            }
-        }
-    };
+/// The running demands out of the registers that hold them, from the most to the least important.
+fn running_demand_list(first: Value, second: Value, third: Value) -> Result<String, ()> {
+    Ok(json(&demand_names(&[first, second, third])))
 }
 
-// From the most to the least important.
-demand_list!(RunningDemandList(first, second, third));
-demand_list!(QueuedDemandList(first, second, third, fourth, fifth));
+fn queued_demand_list(
+    first: Value,
+    second: Value,
+    third: Value,
+    fourth: Value,
+    fifth: Value,
+) -> Result<String, ()> {
+    Ok(json(&demand_names(&[first, second, third, fourth, fifth])))
+}
 
 properties! { static ALARMS = [
     { "any": BooleanValue = register discrete_input(66) },
-    { "active": StringList = custom ActiveAlarmsKind },
+    { "active": custom ActiveAlarmsKind },
     { "class-a": BooleanValue = register discrete_input(0) },
     { "class-b": BooleanValue = register discrete_input(1) },
     { "class-c": BooleanValue = register discrete_input(2) },
     { "class-d": BooleanValue = register discrete_input(3) },
     { "class-e": BooleanValue = register discrete_input(4) },
-    { "reset": ResetAlarms = action },
+    { "reset": action = &[(Register::coil(3), 1)] },
 ] }
 
 properties! { static SYSTEM = [
     { "mode": OperationalMode = register holding(0) },
     { "smart-grid-mode": SmartGridMode = register input(82) },
     { "running-demand": Demand = register input(1) },
-    { "running-demands": RunningDemands = aggregate input(2) },
-    { "running-demands-by-priority": RunningDemandList = aggregate input(1), input(55), input(56) },
-    { "queued-demands": QueuedDemandList =
-        aggregate input(62), input(63), input(64), input(65), input(66) },
-    { "software-version": VersionValue = aggregate input(57), input(58), input(59) },
-    { "control-software-version": VersionValue = aggregate input(311), input(312), input(313) },
+    { "running-demands": aggregate(string_list) = running_demands(input(2)) },
+    { "running-demands-by-priority": aggregate(string_list) = running_demand_list(input(1), input(55), input(56)) },
+    { "queued-demands": aggregate(string_list) = queued_demand_list(input(62), input(63), input(64), input(65), input(66)) },
+    { "software-version": aggregate(text) = version(input(57), input(58), input(59)) },
+    { "control-software-version": aggregate(text) = version(input(311), input(312), input(313)) },
     { "outdoor-temperature": FloatValue = register input(13) },
     { "outdoor-temperature-source": OutdoorTemperatureSource = register holding(117) },
     { "outdoor-temperature-override": FloatValue = register holding(118) },
@@ -213,7 +141,7 @@ properties! { static HEAT_PUMP = [
     { "compressor-gear": FloatValue = register input(61) },
     { "compressor-available-gears": FloatValue = register input(4) },
     { "compressor-start-delay": SecondsValue = register input(60) },
-    { "compressor-operating-time": OperatingTime = aggregate input(48), input(49) },
+    { "compressor-operating-time": aggregate(duration) = operating_time(input(48), input(49)) },
     { "compressor-unable-to-speed-up": BooleanValue = register discrete_input(246) },
     { "stopping": BooleanValue = register discrete_input(224) },
     { "ready-to-start": BooleanValue = register discrete_input(225) },
@@ -285,7 +213,7 @@ properties! { static HEATING = [
     { "return-temperature": FloatValue = register input(27) },
     { "calculated-demand": FloatValue = register input(30) },
     { "selected-heat-curve": FloatValue = register input(19) },
-    { "heat-curve": HeatCurve = custom HeatCurveKind::new(6) },
+    { "heat-curve": custom HeatCurveKind::new(6) },
     { "max-supply-temperature": FloatValue = register holding(3) },
     { "min-supply-temperature": FloatValue = register holding(4) },
     { "comfort-wheel": FloatValue = register holding(5) },
@@ -306,7 +234,7 @@ properties! { static ADDITIONAL_HEATER = [
     { "start-threshold": FloatValue = register holding(75) },
     { "stop-threshold": FloatValue = register holding(78) },
     { "outdoor-temperature-limit": FloatValue = register holding(304) },
-    { "operating-time": OperatingTime = aggregate input(52), input(53) },
+    { "operating-time": aggregate(duration) = operating_time(input(52), input(53)) },
 ] }
 
 properties! { static TAP_WATER = [
@@ -317,7 +245,7 @@ properties! { static TAP_WATER = [
     { "start-temperature": FloatValue = register holding(22) },
     { "stop-temperature": FloatValue = register holding(23) },
     { "directional-valve-position": FloatValue = register input(47) },
-    { "operating-time": OperatingTime = aggregate input(50), input(51) },
+    { "operating-time": aggregate(duration) = operating_time(input(50), input(51)) },
 ] }
 
 properties! { static MIX_VALVE_1 = [
@@ -329,7 +257,7 @@ properties! { static MIX_VALVE_1 = [
     { "circulation-pump": BooleanValue = register discrete_input(209) },
     { "min-supply-temperature": FloatValue = register holding(107) },
     { "max-supply-temperature": FloatValue = register holding(108) },
-    { "heat-curve": HeatCurve = custom HeatCurveKind::new(109) },
+    { "heat-curve": custom HeatCurveKind::new(109) },
     { "outdoor-temperature-dependent-cooling": BooleanValue = register coil(37) },
     { "brine-pump-during-cooling": BooleanValue = register coil(38) },
     { "producing-passive-cooling": BooleanValue = register discrete_input(245) },
@@ -370,7 +298,7 @@ macro_rules! em_mix_valve {
             { "max-position": FloatValue = register holding($max_position) },
             { "min-supply-temperature": FloatValue = register holding($min_supply) },
             { "max-supply-temperature": FloatValue = register holding($max_supply) },
-            { "heat-curve": HeatCurve = custom HeatCurveKind::new($curve) },
+            { "heat-curve": custom HeatCurveKind::new($curve) },
             { "outdoor-temperature-dependent-heating": BooleanValue = register coil($outdoor_heating) },
             { "outdoor-temperature-dependent-cooling": BooleanValue = register coil($outdoor_cooling) },
             { "dew-point-calculation": BooleanValue = register coil($dew_point) },
@@ -531,23 +459,23 @@ properties! { static SECONDARY_UNITS = [
     { "legacy-secondaries": IntegerValue = register input(144) },
     { "total-distributed-gears": IntegerValue = register input(145) },
     { "max-requested-gear": IntegerValue = register input(146) },
-    { "class-a-alarms": UnitBits = aggregate input(162) },
-    { "class-b-alarms": UnitBits = aggregate input(163) },
-    { "class-d-alarms": UnitBits = aggregate input(160) },
-    { "class-e-alarms": UnitBits = aggregate input(170) },
-    { "communication-lost": UnitBits = aggregate input(161) },
-    { "legacy-compressors-running": UnitBits = aggregate input(153) },
-    { "legacy-alarms": UnitBits = aggregate input(154) },
-    { "legacy-start-signals": UnitBits = aggregate input(155) },
-    { "legacy-tap-water-signals": UnitBits = aggregate input(156) },
-    { "legacy-general-alarms": UnitBits = aggregate input(171) },
-    { "legacy-expansion-card-lost": UnitBits = aggregate input(173) },
+    { "class-a-alarms": aggregate(unit_list) = unit_bits(input(162)) },
+    { "class-b-alarms": aggregate(unit_list) = unit_bits(input(163)) },
+    { "class-d-alarms": aggregate(unit_list) = unit_bits(input(160)) },
+    { "class-e-alarms": aggregate(unit_list) = unit_bits(input(170)) },
+    { "communication-lost": aggregate(unit_list) = unit_bits(input(161)) },
+    { "legacy-compressors-running": aggregate(unit_list) = unit_bits(input(153)) },
+    { "legacy-alarms": aggregate(unit_list) = unit_bits(input(154)) },
+    { "legacy-start-signals": aggregate(unit_list) = unit_bits(input(155)) },
+    { "legacy-tap-water-signals": aggregate(unit_list) = unit_bits(input(156)) },
+    { "legacy-general-alarms": aggregate(unit_list) = unit_bits(input(171)) },
+    { "legacy-expansion-card-lost": aggregate(unit_list) = unit_bits(input(173)) },
 ] }
 
 properties! { static POWER = [
     { "output": FloatValue = register input(157) },
     { "consumption": FloatValue = register input(158) },
-    { "cop": CoefficientOfPerformance = aggregate input(157), input(158) },
+    { "cop": aggregate(float) = coefficient_of_performance(input(157), input(158)) },
 ] }
 
 properties! { static POWER_LIMIT = [
@@ -561,21 +489,21 @@ properties! { static STATISTICS = [
     { "heat-cop-today": FloatValue = register input(333) },
     { "heat-natural-today": FloatValue = register input(334) },
     { "heat-internal-heater-today": FloatValue = register input(335) },
-    { "heat-consumed-year": SplitEnergy = aggregate input(350), input(351) },
-    { "heat-delivered-year": SplitEnergy = aggregate input(352), input(353) },
+    { "heat-consumed-year": aggregate(kilowatt_hours) = split_energy(input(350), input(351)) },
+    { "heat-delivered-year": aggregate(kilowatt_hours) = split_energy(input(352), input(353)) },
     { "heat-cop-year": FloatValue = register input(354) },
-    { "heat-natural-year": SplitEnergy = aggregate input(355), input(356) },
-    { "heat-internal-heater-year": SplitEnergy = aggregate input(348), input(349) },
+    { "heat-natural-year": aggregate(kilowatt_hours) = split_energy(input(355), input(356)) },
+    { "heat-internal-heater-year": aggregate(kilowatt_hours) = split_energy(input(348), input(349)) },
     { "tap-water-consumed-today": FloatValue = register input(336) },
     { "tap-water-delivered-today": FloatValue = register input(337) },
     { "tap-water-cop-today": FloatValue = register input(338) },
     { "tap-water-natural-today": FloatValue = register input(339) },
     { "tap-water-internal-heater-today": FloatValue = register input(340) },
-    { "tap-water-consumed-year": SplitEnergy = aggregate input(359), input(360) },
-    { "tap-water-delivered-year": SplitEnergy = aggregate input(361), input(362) },
+    { "tap-water-consumed-year": aggregate(kilowatt_hours) = split_energy(input(359), input(360)) },
+    { "tap-water-delivered-year": aggregate(kilowatt_hours) = split_energy(input(361), input(362)) },
     { "tap-water-cop-year": FloatValue = register input(363) },
-    { "tap-water-natural-year": SplitEnergy = aggregate input(364), input(365) },
-    { "tap-water-internal-heater-year": SplitEnergy = aggregate input(357), input(358) },
+    { "tap-water-natural-year": aggregate(kilowatt_hours) = split_energy(input(364), input(365)) },
+    { "tap-water-internal-heater-year": aggregate(kilowatt_hours) = split_energy(input(357), input(358)) },
 ] }
 
 properties! { static IMMERSION_HEATER = [
@@ -602,7 +530,7 @@ properties! { static ELECTRIC_METER = [
     { "l2-power": IntegerValue = register input(79) },
     { "l3-power": IntegerValue = register input(80) },
     { "meter-value": IntegerValue = register input(81) },
-    { "total-energy": EnergyValue = aggregate input(83), input(84) },
+    { "total-energy": aggregate(kilowatt_hours) = meter_energy(input(83), input(84)) },
 ] }
 
 macro_rules! node {

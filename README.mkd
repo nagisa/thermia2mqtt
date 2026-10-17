@@ -41,10 +41,10 @@ node names are an error. Properties whose registers the heat pump has nothing at
 device description.
 
 `THERMIA2MQTT_LOG=debug` makes it more talkative. At startup it logs how many
-requests one polling cycle takes. The heat pump takes about half a second to answer any request. Each
-connection to it waits for the response before sending the next request, but the connections are
-served independently, so `--connections` (4 by default) is what makes polling fast. `--max-read-count`
-makes for fewer, larger requests.
+requests one polling cycle takes. The heat pump answers one request per connection at a time, which
+takes about half a second, so more connections are opened as needed, up to `--max-connections` (8
+by default), to make polling fast.
+`--max-read-count` makes for fewer, larger requests.
 
 ## Caveats
 
