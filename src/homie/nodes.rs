@@ -45,14 +45,41 @@ string_enum! {
     }
 }
 
+// The guide names the modes differently in different registers: what the mode in effect calls
+// "EVU" and "Comfort", the requested mode calls "EVU" and "Load-Up". Both are named the same here
+// because they are the value and the `$target` of one property.
 string_enum! {
     #[repr(u16)]
     #[derive(Clone, Copy)]
     enum SmartGridMode {
-        Evu = 1,
+        Blocked = 1,
         Normal = 4,
-        Comfort = 5,
+        LoadUp = 5,
         Boost = 6,
+    }
+}
+
+// The smart grid mode that the BMS asks for, when the heat pump is set up for SG-Ready.
+string_enum! {
+    #[repr(u16)]
+    #[derive(Clone, Copy)]
+    enum SmartGridRequest {
+        Normal = 0,
+        LoadUp = 1,
+        Blocked = 2,
+        Boost = 3,
+    }
+}
+
+// The mode that the BMS asks for, when the heat pump is set up for power limitation and load-up
+// (PL/LU) rather than SG-Ready. The guide gives 3 the same meaning as 1, which reads as `unknown`.
+string_enum! {
+    #[repr(u16)]
+    #[derive(Clone, Copy)]
+    enum PowerLimitMode {
+        Normal = 0,
+        Limit = 1,
+        LoadUp = 2,
     }
 }
 
@@ -118,7 +145,6 @@ properties! { static ALARMS = [
 
 properties! { static SYSTEM = [
     { "mode": OperationalMode = register holding(0) },
-    { "smart-grid-mode": SmartGridMode = register input(82) },
     { "running-demand": Demand = register input(1) },
     { "running-demands": aggregate(string_list) = running_demands(input(2)) },
     { "running-demands-by-priority": aggregate(string_list) = running_demand_list(input(1), input(55), input(56)) },
@@ -129,8 +155,6 @@ properties! { static SYSTEM = [
     { "outdoor-temperature-source": OutdoorTemperatureSource = register holding(117) },
     { "outdoor-temperature-override": FloatValue = register holding(118) },
     { "room-temperature": FloatValue = register input(121) },
-    { "smart-grid-1-input": BooleanValue = register discrete_input(201) },
-    { "smart-grid-2-input": BooleanValue = register discrete_input(204) },
     { "external-alarm-input": BooleanValue = register discrete_input(202) },
 ] }
 
@@ -478,8 +502,17 @@ properties! { static POWER = [
     { "cop": aggregate(float) = coefficient_of_performance(input(157), input(158)) },
 ] }
 
+// SG-Ready: the mode is requested either by closing the contacts of the two inputs or by the BMS,
+// and the inputs win. So the mode in effect is the value, and what the BMS has requested is its
+// target.
+properties! { static SMART_GRID = [
+    { "mode": SmartGridMode = register input(82), target SmartGridRequest = holding(124) },
+    { "input-1": BooleanValue = register discrete_input(201) },
+    { "input-2": BooleanValue = register discrete_input(204) },
+] }
+
 properties! { static POWER_LIMIT = [
-    { "control-mode": IntegerValue = register holding(124) },
+    { "mode": PowerLimitMode = register holding(124) },
     { "limit": FloatValue = register holding(125) },
 ] }
 
@@ -539,7 +572,7 @@ macro_rules! node {
     };
 }
 
-static NODES: [Node; 24] = [
+static NODES: [Node; 25] = [
     node!("alarms", "alarms", ALARMS),
     node!("system", "operating mode, versions and sensors of the system", SYSTEM),
     node!("heat-pump", "the compressor and the refrigerant circuit", HEAT_PUMP),
@@ -560,7 +593,12 @@ static NODES: [Node; 24] = [
     node!("surplus-heat", "surplus heat (expansion module)", SURPLUS_HEAT),
     node!("secondary-units", "secondary heat pump units", SECONDARY_UNITS),
     node!("power", "power output and consumption", POWER),
-    node!("power-limit", "limiting the power consumption", POWER_LIMIT),
+    node!("smart-grid", "SG-Ready smart grid control", SMART_GRID),
+    node!(
+        "power-limit",
+        "power limitation and load-up (instead of SG-Ready smart grid control)",
+        POWER_LIMIT
+    ),
     node!("statistics", "energy statistics (registers that Thermia does not document)", STATISTICS),
     node!("immersion-heater", "internal immersion heater", IMMERSION_HEATER),
     node!(
@@ -580,4 +618,4 @@ pub(crate) fn all() -> &'static [Node] {
 /// Those that are not here need accessories, so they would only ever produce errors for most
 /// installations.
 pub(crate) const DEFAULT_NODES: &str =
-    "alarms,system,heat-pump,heating,additional-heater,tap-water";
+    "alarms,system,smart-grid,heat-pump,heating,additional-heater,tap-water";

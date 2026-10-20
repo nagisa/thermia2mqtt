@@ -24,8 +24,8 @@ the tap water start and stop temperatures) from MQTT.
 ### Choosing the nodes
 
 The properties are grouped into nodes. Only the nodes that every installation has are enabled by
-default: `alarms,system,heat-pump,heating,additional-heater,tap-water`. `--nodes` takes a
-comma-separated list and **replaces** that default, so name all the nodes you want, defaults
+default: `alarms,system,smart-grid,heat-pump,heating,additional-heater,tap-water`. `--nodes` takes
+a comma-separated list and **replaces** that default, so name all the nodes you want, defaults
 included:
 
 ```
@@ -34,11 +34,16 @@ thermia2mqtt mqtt --tcp heatpump.local --nodes alarms,system,heat-pump,heating,t
 
 Leaving a node out of the list disables it. The nodes that are not enabled by default are:
 `mix-valve-1` to `mix-valve-5`, `cooling`, `pool`, `twc`, `wcs`, `hgw`, `hot-gas-pump`,
-`surplus-heat`, `secondary-units`, `power`, `power-limit`, `statistics` (these use registers that
-Thermia does not document), `immersion-heater` and `electric-meter`. Many of these need
-accessories or a newer firmware, and the heat pump has nothing at some of their registers. Unknown
-node names are an error. Properties whose registers the heat pump has nothing at are left out of the
-device description.
+`surplus-heat`, `secondary-units`, `power`, `power-limit` (for heat pumps set up for power
+limitation and load-up rather than SG-Ready; it writes the same register as `smart-grid/mode`),
+`statistics` (these use registers that Thermia does not document), `immersion-heater` and
+`electric-meter`. Many of these need accessories or a newer firmware, and the heat pump has nothing
+at some of their registers. Unknown node names are an error. Properties whose registers the heat
+pump has nothing at are left out of the device description.
+
+`smart-grid/mode` is the SG-Ready mode that the heat pump is in. Its `$target` is the mode that was
+requested over Modbus (and what setting the property changes.) The contacts of `input-1` and
+`input-2` can override the request.
 
 `THERMIA2MQTT_LOG=debug` makes it more talkative. At startup it logs how many
 requests one polling cycle takes. The heat pump answers one request per connection at a time, which

@@ -12,7 +12,7 @@ mod nodes;
 mod value;
 
 use crate::homie::node::{Node, PropertyEntry};
-use crate::modbus::{self, PollGroup, Update};
+use crate::modbus::{self, PollGroup, Snapshot, Update};
 use crate::registers::Register;
 use futures::stream::FuturesUnordered;
 use futures::{Future, StreamExt as _};
@@ -208,6 +208,13 @@ fn grow(available: &mut Availability, other: &Availability) -> bool {
     grown
 }
 
+/// What has been published for a property.
+struct Published {
+    value: String,
+    /// The `$target`, for the properties that have one.
+    target: Option<String>,
+}
+
 pub(crate) struct Device {
     args: Args,
     mqtt: rumqttc::v5::AsyncClient,
@@ -224,7 +231,7 @@ pub(crate) struct Device {
     /// removed from the description: when a value goes away the last one stays published.
     available: Availability,
     /// What we have last published, indexed like the properties of `nodes`.
-    published: Vec<Vec<Option<String>>>,
+    published: Vec<Vec<Option<Published>>>,
     modbus: modbus::Handle,
     updates: mpsc::UnboundedReceiver<Update>,
     commands: mpsc::UnboundedReceiver<Command>,
@@ -235,6 +242,7 @@ fn build_description(
     args: &Args,
     nodes: &[&'static Node],
     available: &Availability,
+    snapshot: &Snapshot,
 ) -> HomieDeviceDescription {
     let mut description =
         homie5::device_description::DeviceDescriptionBuilder::new().name("Thermia Genesis");
@@ -244,11 +252,12 @@ fn build_description(
         }
     }
     let mut description = description.build();
-    if !args.allow_writes {
-        for node in &mut description.nodes.values_mut() {
-            for prop in &mut node.properties.values_mut() {
-                prop.settable = false;
-            }
+    for node in nodes {
+        let Some(described) = description.nodes.get_mut(&node.id) else { continue };
+        for property in node.properties {
+            let Some(prop) = described.properties.get_mut(&property.prop_id) else { continue };
+            // The heat pump might not have what is needed to set the property.
+            prop.settable &= args.allow_writes && property.kind.is_settable(snapshot);
         }
     }
     description
@@ -267,8 +276,8 @@ impl Device {
         // What is available is only known once the registers have been read.
         let available: Availability =
             nodes.iter().map(|n| vec![false; n.properties.len()]).collect();
-        let description = build_description(&args, &nodes, &available);
-        let published = nodes.iter().map(|n| vec![None; n.properties.len()]).collect();
+        let description = build_description(&args, &nodes, &available, &modbus.snapshot());
+        let published = nodes.iter().map(|n| n.properties.iter().map(|_| None).collect()).collect();
         Self {
             args,
             mqtt,
@@ -329,7 +338,8 @@ impl Device {
     ///
     /// Must be done while the device is not `ready`.
     async fn publish_properties(&mut self) -> Result<(), Error> {
-        self.description = build_description(&self.args, &self.nodes, &self.available);
+        self.description =
+            build_description(&self.args, &self.nodes, &self.available, &self.modbus.snapshot());
         let p = self
             .protocol
             .publish_description(&self.description)
@@ -405,6 +415,9 @@ impl Device {
 
     /// Publish the current value of a property, if it is a different one from what we have
     /// published last (or `force` is set.)
+    ///
+    /// Properties that have a `$target` publish it every time they publish the value, and before
+    /// it.
     async fn refresh(
         &mut self,
         node_idx: usize,
@@ -416,20 +429,28 @@ impl Device {
         if !self.available[node_idx][prop_idx] {
             return Ok(());
         }
-        let value = {
+        let (value, target) = {
             let snapshot = self.modbus.snapshot();
-            property.kind.read(&snapshot)
+            (property.kind.read(&snapshot), property.kind.target(&snapshot))
         };
         let value = match value {
             Some(Ok(value)) => value,
             // An action, or a value that is not usable right now (the last one stays.)
             None | Some(Err(())) => return Ok(()),
         };
-        if !force && self.published[node_idx][prop_idx].as_deref() == Some(value.as_str()) {
+        // A target that is not usable right now is not published, same as a value.
+        let target = target.and_then(Result::ok);
+        let unchanged = self.published[node_idx][prop_idx]
+            .as_ref()
+            .is_some_and(|p| p.value == value && p.target == target);
+        if !force && unchanged {
             return Ok(());
         }
+        if let Some(target) = &target {
+            self.publish_target(node_idx, prop_idx, target).await?;
+        }
         self.publish_value(node_idx, prop_idx, &value).await?;
-        self.published[node_idx][prop_idx] = Some(value);
+        self.published[node_idx][prop_idx] = Some(Published { value, target });
         Ok(())
     }
 
@@ -457,17 +478,39 @@ impl Device {
             .map_err(|e| Error::PublishValue(e, node.id.clone(), prop_id.clone(), value.into()))
     }
 
-    /// Delete the (retained) value of a property that is not described.
-    async fn erase_value(&mut self, node_idx: usize, prop_idx: usize) -> Result<(), Error> {
+    async fn publish_target(
+        &mut self,
+        node_idx: usize,
+        prop_idx: usize,
+        value: &str,
+    ) -> Result<(), Error> {
         let node: &'static Node = self.nodes[node_idx];
         let prop_id = &node.properties[prop_idx].prop_id;
-        let mut message = self.protocol.publish_value(&node.id, prop_id, &String::new(), true);
-        // An empty payload is how MQTT deletes retained messages.
-        message.payload.clear();
+        let Some(description) = self.description.get_property_by_id(&node.id, prop_id) else {
+            tracing::warn!(node_id = %node.id, %prop_id, "property without description");
+            return Ok(());
+        };
+        let message = self.protocol.publish_target(&node.id, prop_id, value, description.retained);
         self.mqtt
             .homie_publish(message)
             .await
-            .map_err(|e| Error::PublishValue(e, node.id.clone(), prop_id.clone(), String::new()))
+            .map_err(|e| Error::PublishValue(e, node.id.clone(), prop_id.clone(), value.into()))
+    }
+
+    /// Delete the (retained) value, and the target, of a property that is not described.
+    async fn erase_value(&mut self, node_idx: usize, prop_idx: usize) -> Result<(), Error> {
+        let node: &'static Node = self.nodes[node_idx];
+        let prop_id = &node.properties[prop_idx].prop_id;
+        let value = self.protocol.publish_value(&node.id, prop_id, &String::new(), true);
+        let target = self.protocol.publish_target(&node.id, prop_id, "", true);
+        for mut message in [value, target] {
+            // An empty payload is how MQTT deletes retained messages.
+            message.payload.clear();
+            self.mqtt.homie_publish(message).await.map_err(|e| {
+                Error::PublishValue(e, node.id.clone(), prop_id.clone(), String::new())
+            })?;
+        }
+        Ok(())
     }
 
     async fn handle_update(&mut self, update: Update) -> Result<(), Error> {
@@ -532,6 +575,11 @@ impl Device {
             return Ok(());
         }
 
+        if !entry.kind.is_settable(&self.modbus.snapshot()) {
+            tracing::warn!(%node_id, %prop_id, "ignoring a set command, the heat pump cannot set it");
+            return Ok(());
+        }
+
         let Ok(writes) = entry.kind.write(&value) else {
             tracing::warn!(%node_id, %prop_id, value, "property/set could not be understood");
             // The controller is told what the actual value is.
@@ -566,6 +614,10 @@ impl Device {
             }
         }
         // Whatever has happened, make sure the controller knows what the property really is.
+        //
+        // This is also what gives the `$target` the value that was set, as required: the write is
+        // done once the registers have been read back, so the snapshot already has what the heat
+        // pump took (which is the value we were given.) If it refused, the `$target` goes back.
         self.refresh(node_idx, prop_idx, true).await
     }
 
@@ -655,7 +707,6 @@ impl Command {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::modbus::Snapshot;
     use crate::registers::Space;
     use clap::Parser as _;
     use homie5::device_description::HomiePropertyFormat;
@@ -693,16 +744,22 @@ mod tests {
         description.get_property_by_id(&node, &prop).is_some()
     }
 
+    fn settable(description: &HomieDeviceDescription, node_id: &str, prop_id: &str) -> bool {
+        let (node, prop) =
+            (node_id.parse::<HomieID>().unwrap(), prop_id.parse::<HomieID>().unwrap());
+        description.get_property_by_id(&node, &prop).expect("described").settable
+    }
+
     /// A device that is not connected to anything, with the registers as the snapshot has them.
     ///
-    /// Publishing queues the messages in the client, which is never polled, so they are dropped
-    /// along with the returned event loop.
-    fn test_device(args: Args, snapshot: Snapshot) -> (Device, rumqttc::v5::EventLoop) {
+    /// Publishing queues the messages for the returned receiver, nothing sends them anywhere.
+    fn test_device(
+        args: Args,
+        snapshot: Snapshot,
+    ) -> (Device, flume::Receiver<rumqttc::v5::Request>) {
         let nodes = select_nodes(&args).unwrap();
-        let (client, events) = rumqttc::v5::AsyncClient::new(
-            rumqttc::v5::MqttOptions::new("test", "127.0.0.1", 1883),
-            10_000,
-        );
+        let (requests_tx, requests) = flume::unbounded();
+        let client = rumqttc::v5::AsyncClient::from_senders(requests_tx);
         let (protocol, _) = Homie5DeviceProtocol::new(
             "thermia".to_string().try_into().unwrap(),
             homie5::HomieDomain::Default,
@@ -711,7 +768,21 @@ mod tests {
         let (_, commands) = mpsc::unbounded_channel();
         let handle = modbus::Handle::detached(snapshot);
         handle.snapshot_mut().set_reachable(true);
-        (Device::new(args, client, protocol, nodes, handle, updates, commands), events)
+        (Device::new(args, client, protocol, nodes, handle, updates, commands), requests)
+    }
+
+    /// The topics and payloads of the messages published so far.
+    fn published(requests: &flume::Receiver<rumqttc::v5::Request>) -> Vec<(String, String)> {
+        requests
+            .try_iter()
+            .filter_map(|request| match request {
+                rumqttc::v5::Request::Publish(p) => Some((
+                    String::from_utf8(p.topic.to_vec()).unwrap(),
+                    String::from_utf8(p.payload.to_vec()).unwrap(),
+                )),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Every register the nodes need is 1, apart from what is overridden.
@@ -744,8 +815,9 @@ mod tests {
                 let registers = property.kind.registers();
                 if description.settable {
                     // Either there's registers that can be written to, or this is an action.
+                    // (The value of a property with a target need not be writable, the target is.)
                     assert!(
-                        registers.iter().all(|r| r.space().is_writable()),
+                        registers.is_empty() || registers.iter().any(|r| r.space().is_writable()),
                         "{name} is settable, but is not backed by writable registers"
                     );
                     assert_eq!(registers.is_empty(), !description.retained, "{name}");
@@ -766,7 +838,7 @@ mod tests {
         let nodes = select_nodes(&args).unwrap();
         let available: Availability =
             nodes.iter().map(|n| vec![true; n.properties.len()]).collect();
-        let description = build_description(&args, &nodes, &available);
+        let description = build_description(&args, &nodes, &available, &Snapshot::new());
         let (protocol, _) = Homie5DeviceProtocol::new(
             "thermia".to_string().try_into().unwrap(),
             homie5::HomieDomain::Default,
@@ -805,7 +877,7 @@ mod tests {
             "PT133417H"
         );
         assert_eq!(value_of("system", "running-demand", &snapshot).unwrap(), "heat");
-        assert_eq!(value_of("system", "smart-grid-mode", &snapshot).unwrap(), "comfort");
+        assert_eq!(value_of("smart-grid", "mode", &snapshot).unwrap(), "load-up");
         assert_eq!(value_of("system", "mode", &snapshot).unwrap(), "on");
         assert_eq!(value_of("heating", "enabled", &snapshot).unwrap(), "true");
         // (1 << 16 | 2) / 10
@@ -865,6 +937,77 @@ mod tests {
         let mode = property("system", "mode");
         assert_eq!(mode.kind.write("on"), Ok(vec![(Register::holding(0), 3)]));
         assert!(mode.kind.write("unknown").is_err());
+    }
+
+    #[test]
+    fn the_target_is_what_was_requested() {
+        let mode = property("smart-grid", "mode");
+        // The heat pump runs in load-up as asked by the contacts, the BMS wants boost.
+        let snapshot = snapshot(&[(Space::Input, 82, 5), (Space::Holding, 124, 3)]);
+        assert_eq!(mode.kind.read(&snapshot), Some(Ok("load-up".to_string())));
+        assert_eq!(mode.kind.target(&snapshot), Some(Ok("boost".to_string())));
+        assert!(mode.kind.is_settable(&snapshot));
+        // What is written is the target, using the words of the target.
+        assert_eq!(mode.kind.write("blocked"), Ok(vec![(Register::holding(124), 2)]));
+        assert_eq!(mode.kind.write("load-up"), Ok(vec![(Register::holding(124), 1)]));
+        assert!(mode.kind.write("unknown").is_err());
+        assert!(mode.kind.description().settable);
+
+        // Old firmware does not have the register.
+        let mut snapshot = self::snapshot(&[(Space::Input, 82, 5)]);
+        snapshot.set_unreadable(Space::Holding, 124);
+        assert_eq!(mode.kind.target(&snapshot), None);
+        assert!(!mode.kind.is_settable(&snapshot));
+        // Properties of other kinds have no target, and can be set if they are writable.
+        let top = property("tap-water", "top-temperature");
+        assert_eq!(top.kind.target(&snapshot), None);
+    }
+
+    #[tokio::test]
+    async fn the_target_is_published_before_the_value() {
+        let args = Args::parse_from(["test", "--allow-writes", "--nodes", "smart-grid"]);
+        let words = all_registers(&args, &[(Space::Input, 82, 5), (Space::Holding, 124, 3)]);
+        let (mut device, requests) = test_device(args, snapshot(&words));
+        device.republish().await.unwrap();
+        assert!(settable(&device.description, "smart-grid", "mode"));
+        let order = |messages: &[(String, String)]| {
+            let position = |topic: &str| messages.iter().position(|(t, _)| t.ends_with(topic));
+            (position("smart-grid/mode/$target"), position("smart-grid/mode"))
+        };
+        let messages = published(&requests);
+        let (target, value) = order(&messages);
+        assert!(target.unwrap() < value.unwrap(), "{messages:?}");
+        assert_eq!(messages[target.unwrap()].1, "boost");
+        assert_eq!(messages[value.unwrap()].1, "load-up");
+
+        // Only the target changes: it is published, and the value is published after it.
+        device.modbus.snapshot_mut().set(Space::Holding, 124, 2);
+        device.handle_update(Update { changed: vec![Register::holding(124)] }).await.unwrap();
+        let messages = published(&requests);
+        let (target, value) = order(&messages);
+        assert!(target.unwrap() < value.unwrap(), "{messages:?}");
+        assert_eq!(messages[target.unwrap()].1, "blocked");
+
+        // Nothing has changed, nothing is published.
+        device.handle_update(Update { changed: vec![Register::holding(124)] }).await.unwrap();
+        assert!(published(&requests).is_empty());
+    }
+
+    #[tokio::test]
+    async fn there_is_no_target_when_the_heat_pump_has_no_register_for_it() {
+        let args = Args::parse_from(["test", "--allow-writes", "--nodes", "smart-grid"]);
+        let mut words = all_registers(&args, &[(Space::Input, 82, 5)]);
+        words.retain(|&(space, address, _)| (space, address) != (Space::Holding, 124));
+        let mut snapshot = snapshot(&words);
+        snapshot.set_unreadable(Space::Holding, 124);
+        let (mut device, requests) = test_device(args, snapshot);
+        device.republish().await.unwrap();
+        let messages = published(&requests);
+        let has = |topic: &str, payload: &str| {
+            messages.iter().any(|(t, p)| t.ends_with(topic) && p == payload)
+        };
+        assert!(has("smart-grid/mode", "load-up"), "{messages:?}");
+        assert!(!messages.iter().any(|(t, p)| t.ends_with("$target") && !p.is_empty()));
     }
 
     #[test]
@@ -1027,7 +1170,12 @@ mod tests {
 
     #[tokio::test]
     async fn registers_that_the_heat_pump_does_not_have() {
-        let args = Args::parse_from(["test", "--nodes", "alarms,power,power-limit"]);
+        let args = Args::parse_from([
+            "test",
+            "--allow-writes",
+            "--nodes",
+            "alarms,power,smart-grid,power-limit",
+        ]);
         // No alarms are active.
         let quiet: Vec<_> = property("alarms", "active")
             .kind
@@ -1054,7 +1202,10 @@ mod tests {
         assert!(is_described(&device.description, "alarms", "active"));
         assert!(is_described(&device.description, "power", "output"));
         assert!(!is_described(&device.description, "power-limit", "limit"));
-        assert!(!is_described(&device.description, "power-limit", "control-mode"));
+        assert!(!is_described(&device.description, "power-limit", "mode"));
+        // Without the register to request the mode with the mode is still there, but cannot be set.
+        assert!(is_described(&device.description, "smart-grid", "mode"));
+        assert!(!settable(&device.description, "smart-grid", "mode"));
     }
 
     #[test]

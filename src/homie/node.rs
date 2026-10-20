@@ -40,6 +40,19 @@ pub(crate) trait PropertyKind: Send + Sync {
     /// they hold is not a usable value.
     fn read(&self, snapshot: &Snapshot) -> Option<Result<String, ()>>;
 
+    /// The value the property is being brought to, as it is to be published in `$target`.
+    ///
+    /// Same as [`read`](Self::read), but `None` also means that the property has no target.
+    fn target(&self, _snapshot: &Snapshot) -> Option<Result<String, ()>> {
+        None
+    }
+
+    /// Whether the property can be set, given what the heat pump has. The description says
+    /// `settable` only if this is so.
+    fn is_settable(&self, _snapshot: &Snapshot) -> bool {
+        true
+    }
+
     /// What needs to be written into the registers to set the property to the value received from
     /// MQTT. Fails if the property cannot be set to that value.
     fn write(&self, value: &str) -> Result<Vec<(Register, u16)>, ()>;
@@ -101,6 +114,70 @@ where
         description.settable = self.register.space().is_writable();
         if description.unit.is_none() {
             description.unit = homie_unit(self.register.def().unit).map(str::to_string);
+        }
+        description
+    }
+}
+
+/// A property whose value is one register, set by writing another: the value is what is in effect,
+/// and the other register is the target that the value is to reach.
+///
+/// The target is published as the `$target` attribute of the property. Heat pumps that do not have
+/// the register for the target have the property read-only and without the target.
+pub(crate) struct TargetedPropertyKind<V, T> {
+    /// The register of the value and the register of the target.
+    registers: [Register; 2],
+    _types: PhantomData<fn() -> (V, T)>,
+}
+
+impl<V, T> TargetedPropertyKind<V, T> {
+    pub(crate) const fn new(value: Register, target: Register) -> Self {
+        Self { registers: [value, target], _types: PhantomData }
+    }
+
+    fn value_register(&self) -> Register {
+        self.registers[0]
+    }
+
+    fn target_register(&self) -> Register {
+        self.registers[1]
+    }
+}
+
+impl<V, T> PropertyKind for TargetedPropertyKind<V, T>
+where
+    V: PropertyValue + TryFrom<Value>,
+    T: PropertyValue + TryFrom<Value> + for<'a> TryFrom<&'a str>,
+{
+    fn registers(&self) -> &[Register] {
+        &self.registers
+    }
+
+    fn read(&self, snapshot: &Snapshot) -> Option<Result<String, ()>> {
+        let value = snapshot.value(self.value_register())?;
+        Some(V::try_from(value).map(|v| v.value()).map_err(|_| ()))
+    }
+
+    fn target(&self, snapshot: &Snapshot) -> Option<Result<String, ()>> {
+        let value = snapshot.value(self.target_register())?;
+        Some(T::try_from(value).map(|v| v.value()).map_err(|_| ()))
+    }
+
+    fn is_settable(&self, snapshot: &Snapshot) -> bool {
+        !snapshot.is_unreadable(self.target_register())
+    }
+
+    fn write(&self, value: &str) -> Result<Vec<(Register, u16)>, ()> {
+        let value = T::try_from(value).map_err(|_| ())?;
+        let raw = value.to_raw(self.target_register()).ok_or(())?;
+        Ok(vec![(self.target_register(), raw)])
+    }
+
+    fn description(&self) -> HomiePropertyDescription {
+        let mut description = V::description();
+        description.settable = self.target_register().space().is_writable();
+        if description.unit.is_none() {
+            description.unit = homie_unit(self.value_register().def().unit).map(str::to_string);
         }
         description
     }
@@ -169,6 +246,9 @@ pub(crate) struct PropertyEntry {
 /// Each property is `{ "id": kind }`, where `kind` is one of:
 ///
 /// * `ValueType = register space(address)` -- a property that is a single register;
+/// * `ValueType = register space(address), target TargetType = space(address)` -- a property
+///   that is a single register, and is set by writing to another one (which is also the `$target`
+///   of the property);
 /// * `aggregate(describe) = compute(space(address), …)` -- the value is `compute` of these
 ///   registers, described as `describe` in [`crate::homie::value`];
 /// * `action = &[(register, word), …]` -- a property that writes these when set to `now`;
@@ -204,6 +284,17 @@ macro_rules! properties {
     };
     (@property $prop_id:literal: custom $kind:expr) => {
         PropertyEntry { prop_id: HomieID::new_const($prop_id), kind: &$kind }
+    };
+    (@property $prop_id:literal: $value_type:ty = register $space:ident ($address:literal),
+        target $target_type:ty = $target_space:ident ($target_address:literal)
+    ) => {
+        PropertyEntry {
+            prop_id: HomieID::new_const($prop_id),
+            kind: &$crate::homie::node::TargetedPropertyKind::<$value_type, $target_type>::new(
+                $crate::registers::Register::$space($address),
+                $crate::registers::Register::$target_space($target_address),
+            ),
+        }
     };
     (@property $prop_id:literal: $value_type:ty = register $space:ident ($address:literal)) => {
         PropertyEntry {
